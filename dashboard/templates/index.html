@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Phase 2 Control Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/static/terminal.css" />
+</head>
+<body class="bg-gray-50 text-gray-900 min-h-screen">
+  <header class="bg-slate-900 text-white shadow-lg">
+    <div class="max-w-7xl mx-auto px-4 py-5">
+      <div class="text-center mb-4">
+        <h1 class="text-xl md:text-2xl font-bold tracking-wide">AI-ENABLED SPACE SITUATIONAL AWARENESS</h1>
+        <p class="text-slate-300 text-sm md:text-base mt-1">PHASE 2 — CONTROL CENTER</p>
+      </div>
+      <div class="flex flex-wrap justify-center items-center gap-2">
+        <span class="text-xs text-slate-400 uppercase tracking-wide mr-2">Mode:</span>
+        <div id="mode-switch" class="inline-flex rounded-lg bg-slate-800 p-1 border border-slate-700">
+          <button type="button" data-mode="SYNTHETIC" class="mode-btn px-3 py-1.5 text-xs font-semibold rounded-md transition">
+            🧪 Synthetic
+          </button>
+          <button type="button" data-mode="ACTUAL" class="mode-btn px-3 py-1.5 text-xs font-semibold rounded-md transition">
+            📡 Live / Actual
+          </button>
+        </div>
+        <span id="mode-hint" class="text-xs text-slate-400 hidden md:inline">Space-Track + DISCOS + MMT</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-7xl mx-auto px-4 py-6 space-y-6">
+    <!-- Status bar -->
+    <section class="card flex flex-wrap items-center gap-4 justify-between">
+      <div class="flex flex-wrap items-center gap-3">
+        <span id="status-badge" class="status-idle text-white text-xs font-bold px-3 py-1 rounded-full uppercase">IDLE</span>
+        <div class="text-sm"><span class="text-gray-500">Started:</span> <span id="started-at">—</span></div>
+        <div class="text-sm"><span class="text-gray-500">Elapsed:</span> <span id="elapsed">—</span></div>
+        <div class="text-sm"><span class="text-gray-500">Current:</span> <span id="current-stage">—</span></div>
+      </div>
+      <div id="error-banner" class="hidden w-full bg-red-50 border border-red-200 text-red-800 text-sm rounded p-3"></div>
+    </section>
+
+    <!-- Controls -->
+    <section class="card">
+      <h2 class="text-sm font-semibold text-gray-500 uppercase mb-3">Pipeline Control</h2>
+      <div class="flex flex-wrap gap-3 mb-4">
+        <button id="btn-run-full" class="bg-blue-600 hover:bg-blue-700 text-white font-semibold px-4 py-2 rounded shadow text-sm">
+          ▶ RUN FULL PHASE 2 PIPELINE
+        </button>
+        <button id="btn-stop" disabled class="bg-red-600 hover:bg-red-700 disabled:opacity-40 text-white font-semibold px-4 py-2 rounded shadow text-sm">
+          ■ STOP
+        </button>
+        <button id="btn-reset-all" class="bg-orange-600 hover:bg-orange-700 disabled:opacity-40 text-white font-semibold px-4 py-2 rounded shadow text-sm">
+          🔄 Reset / Clear All Data
+        </button>
+      </div>
+      <div class="flex flex-wrap gap-2">
+        <button data-stage="fetch" class="stage-btn bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-medium px-3 py-2 rounded border">↻ Ingestion</button>
+        <button data-stage="prepare" class="stage-btn bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-medium px-3 py-2 rounded border">↻ Prepare</button>
+        <button data-stage="stage1" class="stage-btn bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-medium px-3 py-2 rounded border">↻ Stage 1</button>
+        <button data-stage="stage2" class="stage-btn bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-medium px-3 py-2 rounded border">↻ Stage 2</button>
+        <button data-stage="inference" class="stage-btn bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-medium px-3 py-2 rounded border">↻ Inference</button>
+      </div>
+    </section>
+
+    <!-- Stepper + Terminal -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <section class="card lg:col-span-1">
+        <h2 class="text-sm font-semibold text-gray-500 uppercase mb-3">Pipeline Progress</h2>
+        <ol id="stepper" class="space-y-2 text-sm"></ol>
+      </section>
+      <section class="card lg:col-span-2">
+        <div class="flex justify-between items-center mb-2">
+          <h2 class="text-sm font-semibold text-gray-500 uppercase">Live Terminal</h2>
+          <button id="btn-clear-log" class="text-xs text-gray-500 hover:text-gray-800">Clear view</button>
+        </div>
+        <div id="terminal-log"></div>
+      </section>
+    </div>
+
+    <!-- Metrics -->
+    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+      <section class="card" id="card-ingestion">
+        <h3 class="font-semibold mb-2">Data Ingestion</h3>
+        <div id="ingestion-content" class="text-sm text-gray-600 space-y-1">No data yet.</div>
+      </section>
+      <section class="card" id="card-quality">
+        <h3 class="font-semibold mb-2">Data Quality</h3>
+        <div id="quality-content" class="text-sm text-gray-600 space-y-1">Run preparation to populate.</div>
+      </section>
+      <section class="card" id="card-leakage">
+        <h3 class="font-semibold mb-2">Leakage Protection</h3>
+        <div id="leakage-content" class="text-sm text-gray-600">—</div>
+      </section>
+      <section class="card" id="card-photometry">
+        <h3 class="font-semibold mb-2">Photometry &amp; Light-Curve</h3>
+        <div id="photometry-content" class="text-sm text-gray-600">No photometric data yet.</div>
+      </section>
+      <section class="card md:col-span-2 xl:col-span-2" id="card-stage1">
+        <h3 class="font-semibold mb-2">Stage 1 — Classification</h3>
+        <div id="stage1-content" class="text-sm overflow-x-auto">No metrics yet.</div>
+      </section>
+      <section class="card" id="card-stage2">
+        <h3 class="font-semibold mb-2">Stage 2 — Characterization</h3>
+        <div id="stage2-content" class="text-sm">No metrics yet.</div>
+      </section>
+      <section class="card md:col-span-2" id="card-inference">
+        <h3 class="font-semibold mb-2">End-to-End Inference</h3>
+        <div id="inference-content" class="text-sm text-gray-600">Run inference to see results.</div>
+      </section>
+    </div>
+
+    <!-- Previous Runs -->
+    <section class="card">
+      <div class="flex flex-wrap justify-between items-center gap-3 mb-4">
+        <h2 class="text-sm font-semibold text-gray-500 uppercase">Previous Runs</h2>
+        <button id="btn-clear-runs" class="text-sm bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 px-3 py-1.5 rounded">
+          🗑️ Clear All Runs
+        </button>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="min-w-full text-sm">
+          <thead>
+            <tr class="border-b text-left text-gray-500">
+              <th class="py-2 pr-4">Run ID</th>
+              <th class="py-2 pr-4">Started</th>
+              <th class="py-2 pr-4">Status</th>
+              <th class="py-2 pr-4">Duration</th>
+              <th class="py-2 pr-4">Stages</th>
+              <th class="py-2">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="runs-tbody">
+            <tr><td colspan="6" class="py-4 text-gray-400">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
