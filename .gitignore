@@ -6,6 +6,7 @@ __pycache__/
 .agents/
 .claude/
 .env
+pdfs/
 
 # Regenerable pipeline outputs
 data/raw/*.csv
