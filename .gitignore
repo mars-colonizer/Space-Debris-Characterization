@@ -7,15 +7,3 @@ __pycache__/
 .claude/
 .env
 pdfs/
-
-# Regenerable pipeline outputs
-data/raw/*.csv
-data/processed/*
-!data/processed/.gitkeep
-data/database/*.db
-models/*
-!models/.gitkeep
-results/*
-!results/.gitkeep
-results/pipeline_runs/*
-!results/pipeline_runs/.gitkeep
