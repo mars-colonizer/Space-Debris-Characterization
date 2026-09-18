@@ -16,8 +16,13 @@ VERBOSE = False
 
 def add_verbosity_args(parser: argparse.ArgumentParser) -> None:
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--verbose", action="store_true", help="Print extra diagnostic details")
-    group.add_argument("--quiet", action="store_true", help="Print errors and final status only")
+    group.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print extra diagnostic details",
+    )
+    group.add_argument("-q", "--quiet", action="store_true", help="Print errors and final status only")
 
 
 def configure_from_args(args: argparse.Namespace) -> None:

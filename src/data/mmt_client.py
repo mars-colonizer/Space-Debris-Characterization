@@ -6,23 +6,33 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
 import requests
-from scipy.signal import lombscargle
 from scipy.stats import skew
 
-from src.config import COSPAR_ID_COL, DATA_RAW, OBJECT_ID_COL, PHOTOMETRIC_FEATURE_COLS
+from src.config import COSPAR_ID_COL, DATA_RAW, LIGHTCURVE_ERR_COL, LIGHTCURVE_MAG_COL, LIGHTCURVE_TIME_COL, OBJECT_ID_COL
+from src.features.period_analysis import analyze_rotation_period
 from src.data.env import load_project_env
+from src.data.mmt9_client import MMT9Client, mmt9_enabled
 
 logger = logging.getLogger(__name__)
 
 MMT_RAW_DIR = DATA_RAW / "mmt_lightcurves"
 DEFAULT_API_URL = "https://mmt.insap.org/api/lightcurve"  # ponytail: placeholder; offline CSV is primary POC path
 FETCH_TIMEOUT_SEC = 15
-TUMBLING_POWER_RATIO = 0.03  # max_power/total_power below this => no dominant period (tumbling)
+
+# Per-curve summaries written to photometric_observations.csv (not the Phase-3 object aggregates).
+_CURVE_PHOTO_COLS = [
+    "mag_mean",
+    "mag_std",
+    "delta_mag",
+    "estimated_period_sec",
+    "apparent_shape_score",
+    "is_tumbling",
+]
 
 
 def extract_photometric_features(
@@ -33,7 +43,7 @@ def extract_photometric_features(
     """
     Derive summary photometric features from a light-curve time series.
 
-    Returns keys aligned with PHOTOMETRIC_FEATURE_COLS.
+    Returns keys aligned with per-curve photo summaries (legacy analyze_periods path).
     """
     mags = np.asarray(magnitudes, dtype=float)
     ts = _to_elapsed_seconds(timestamps)
@@ -49,7 +59,7 @@ def extract_photometric_features(
     if err is not None:
         err = err[valid]
 
-    empty = {col: np.nan for col in PHOTOMETRIC_FEATURE_COLS}
+    empty = {col: np.nan for col in _CURVE_PHOTO_COLS}
     empty["is_tumbling"] = 0
     if len(mags) < 3:
         return empty
@@ -59,32 +69,19 @@ def extract_photometric_features(
     delta_mag = float(np.nanpercentile(mags, 95) - np.nanpercentile(mags, 5))
     apparent_shape_score = float(skew(mags, nan_policy="omit"))
 
-    centered = mags - np.mean(mags)
-    t_span = float(ts.max() - ts.min())
-    if t_span < 1.0:
-        ts = np.linspace(0.0, max(len(ts) - 1, 1), len(ts))
-
-    freqs = np.linspace(1.0 / 3600.0, 1.0 / 1.0, 500)
-    try:
-        power = lombscargle(ts, centered, freqs, normalize=True)
-    except Exception:
-        power = np.zeros_like(freqs)
-
-    peak_idx = int(np.argmax(power))
-    f0 = float(freqs[peak_idx])
-    estimated_period_sec = float(np.clip(1.0 / f0 if f0 > 0 else 3600.0, 1.0, 3600.0))
-
-    peak_power = float(power[peak_idx])
-    total_power = float(np.sum(power)) + 1e-12
-    is_tumbling = 1 if (peak_power / total_power) < TUMBLING_POWER_RATIO else 0
+    period = analyze_rotation_period(ts, mags)
+    estimated_period_sec = period["extracted_period_sec"] or period["pdm_period_sec"]
 
     return {
         "mag_mean": round(mag_mean, 4),
         "mag_std": round(mag_std, 4),
         "delta_mag": round(delta_mag, 4),
-        "estimated_period_sec": round(estimated_period_sec, 3),
+        "estimated_period_sec": round(float(estimated_period_sec), 3) if estimated_period_sec else None,
+        "lsp_period_sec": period["lsp_period_sec"],
+        "pdm_period_sec": period["pdm_period_sec"],
+        "pdm_theta": period["pdm_theta"],
         "apparent_shape_score": round(apparent_shape_score, 4),
-        "is_tumbling": int(is_tumbling),
+        "is_tumbling": int(period["is_tumbling"]),
     }
 
 
@@ -117,16 +114,27 @@ class MMTClient:
         self.api_url = api_url or (os.getenv("MMT_API_URL") or DEFAULT_API_URL)
         self.offline_dir = Path(offline_dir or MMT_RAW_DIR)
         self.timeout_sec = timeout_sec
+        self._mmt9: MMT9Client | None = None
 
     def fetch_lightcurve(
         self,
         cospar_id: str | None = None,
         norad_id: str | int | None = None,
+        offline_only: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Return (timestamps, visual_magnitudes, errors) for one object.
-        Tries live API first, then local offline files.
+        Tries MMT-9 (mmt.favor2.info), placeholder API, then local offline files.
         """
+        if mmt9_enabled() and norad_id is not None:
+            try:
+                return self._fetch_mmt9(norad_id=norad_id)
+            except FileNotFoundError:
+                logger.debug("No MMT-9 data for norad=%s", norad_id)
+            except Exception as exc:
+                logger.warning("MMT-9 fetch failed (%s) — trying offline cache", exc)
+        if offline_only or mmt9_enabled():
+            return self._fetch_offline(cospar_id=cospar_id, norad_id=norad_id)
         try:
             return self._fetch_api(cospar_id=cospar_id, norad_id=norad_id)
         except Exception as exc:
@@ -138,25 +146,62 @@ class MMTClient:
         objects: pd.DataFrame,
         cospar_col: str = COSPAR_ID_COL,
         norad_col: str = OBJECT_ID_COL,
+        offline_only: bool = False,
+        write_combined_csv: bool = True,
+        progress_callback: Callable[[int, int, str | int], None] | None = None,
     ) -> pd.DataFrame:
         """Extract photometric summary rows for all objects in frame."""
         rows: list[dict[str, Any]] = []
-        for _, obj in objects.iterrows():
+        lc_rows: list[dict[str, Any]] = []
+        pending = [obj for _, obj in objects.iterrows() if not (pd.isna(obj.get(cospar_col)) and pd.isna(obj.get(norad_col)))]
+        total = len(pending)
+        for idx, obj in enumerate(pending, start=1):
             cospar = obj.get(cospar_col)
             norad = obj.get(norad_col)
-            if pd.isna(cospar) and pd.isna(norad):
-                continue
+            label = norad if norad is not None and not pd.isna(norad) else cospar
+            if progress_callback:
+                progress_callback(idx, total, label)
             try:
                 ts, mags, errs = self.fetch_lightcurve(
                     cospar_id=None if pd.isna(cospar) else str(cospar),
                     norad_id=None if pd.isna(norad) else norad,
+                    offline_only=offline_only,
                 )
                 feats = extract_photometric_features(ts, mags, errs)
+                if write_combined_csv and mmt9_enabled() and norad is not None and not pd.isna(norad):
+                    for t, m, e in zip(ts, mags, errs):
+                        lc_rows.append({
+                            COSPAR_ID_COL: cospar,
+                            OBJECT_ID_COL: int(norad),
+                            LIGHTCURVE_TIME_COL: t,
+                            LIGHTCURVE_MAG_COL: float(m),
+                            LIGHTCURVE_ERR_COL: float(e),
+                        })
             except FileNotFoundError:
                 logger.debug("No MMT data for cospar=%s norad=%s", cospar, norad)
                 continue
-            rows.append({COSPAR_ID_COL: cospar, **feats})
+            row = {COSPAR_ID_COL: cospar, **feats}
+            if norad is not None and not pd.isna(norad):
+                row[OBJECT_ID_COL] = int(norad)
+            rows.append(row)
+
+        if lc_rows:
+            combined = self.offline_dir / "mmt_lightcurves.csv"
+            combined.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(lc_rows).to_csv(combined, index=False)
+
         return pd.DataFrame(rows)
+
+    def _mmt9_client(self) -> MMT9Client:
+        if self._mmt9 is None:
+            self._mmt9 = MMT9Client()
+        return self._mmt9
+
+    def _fetch_mmt9(
+        self,
+        norad_id: str | int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return self._mmt9_client().fetch_lightcurve(norad_id)
 
     def _fetch_api(
         self,
@@ -276,9 +321,10 @@ def save_photometric_csv(df: pd.DataFrame, path: Path | None = None) -> Path:
 
 
 if __name__ == "__main__":
-    # ponytail: minimal self-check — fails if Lomb-Scargle path breaks
-    t = np.linspace(0, 120, 200)
+    # ponytail: minimal self-check — fails if Lomb-Scargle/PDM path breaks
+    t = np.linspace(0, 600, 400)
     m = 10 + 0.8 * np.sin(2 * np.pi * t / 15.0)
     out = extract_photometric_features(t, m)
     assert out["delta_mag"] > 0.5 and out["is_tumbling"] == 0, out
+    assert out["estimated_period_sec"] is not None, out
     print("mmt_client self-check OK:", out)

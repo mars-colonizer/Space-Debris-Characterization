@@ -131,3 +131,116 @@ def fetch_discos_objects(
     if CLASS_COL in df.columns:
         logger.info("DISCOS classes:\n%s", df[CLASS_COL].value_counts())
     return df
+
+
+def fetch_discos_by_norad(
+    norad_ids: list[int | str],
+    batch_size: int = 50,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> pd.DataFrame:
+    """Fetch DISCOS metadata for specific NORAD catalog numbers (MMT-driven lookup)."""
+    ids = sorted({int(i) for i in norad_ids})
+    if not ids:
+        return pd.DataFrame()
+
+    rows: list[dict[str, Any]] = []
+    for start in range(0, len(ids), batch_size):
+        batch = ids[start : start + batch_size]
+        id_csv = ",".join(str(i) for i in batch)
+        page = 1
+        while True:
+            batch_rows = _fetch_page({
+                "filter": f"in(satno,({id_csv}))",
+                "page[number]": page,
+                "page[size]": PAGE_SIZE,
+            })
+            for item in batch_rows:
+                row = _object_to_row(item)
+                if row[COSPAR_ID_COL] or row.get("satno") is not None:
+                    rows.append(row)
+            if progress_callback:
+                progress_callback(min(start + len(batch), len(ids)), len(ids))
+            if not batch_rows or len(batch_rows) < PAGE_SIZE:
+                break
+            page += 1
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        logger.warning("DISCOS: no matches for %d NORAD IDs", len(ids))
+        return df
+    df = df.drop_duplicates(subset=["satno"], keep="first")
+    logger.info("DISCOS: matched %d / %d NORAD IDs", len(df), len(ids))
+    return df
+
+
+def fetch_discos_by_cospar(
+    cospar_ids: list[str],
+    batch_size: int = 50,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> pd.DataFrame:
+    """Fetch DISCOS metadata by International Designator (COSPAR ID)."""
+    from src.data.clean_data import normalize_cospar_id
+
+    ids = sorted({
+        normalize_cospar_id(pd.Series([c])).iloc[0]
+        for c in cospar_ids
+        if c and not pd.isna(c)
+    })
+    ids = [i for i in ids if i]
+    if not ids:
+        return pd.DataFrame()
+
+    rows: list[dict[str, Any]] = []
+    for start in range(0, len(ids), batch_size):
+        batch = ids[start : start + batch_size]
+        quoted = ",".join(f"'{c}'" for c in batch)
+        page = 1
+        while True:
+            batch_rows = _fetch_page({
+                "filter": f"in(cosparId,({quoted}))",
+                "page[number]": page,
+                "page[size]": PAGE_SIZE,
+            })
+            for item in batch_rows:
+                row = _object_to_row(item)
+                if row[COSPAR_ID_COL] or row.get("satno") is not None:
+                    rows.append(row)
+            if progress_callback:
+                progress_callback(min(start + len(batch), len(ids)), len(ids))
+            if not batch_rows or len(batch_rows) < PAGE_SIZE:
+                break
+            page += 1
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        logger.warning("DISCOS: no matches for %d COSPAR IDs", len(ids))
+        return df
+    df = df.drop_duplicates(subset=[COSPAR_ID_COL], keep="first")
+    logger.info("DISCOS: matched %d / %d COSPAR IDs", len(df), len(ids))
+    return df
+
+
+def fetch_discos_for_objects(
+    norad_ids: list[int | str],
+    cospar_map: dict[str, str],
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> pd.DataFrame:
+    """Fetch DISCOS by NORAD, then by COSPAR for any NORAD misses."""
+    discos = fetch_discos_by_norad(norad_ids, progress_callback=progress_callback)
+    matched_norad: set[int] = set()
+    if not discos.empty and "satno" in discos.columns:
+        matched_norad = set(pd.to_numeric(discos["satno"], errors="coerce").dropna().astype(int))
+
+    missing_cospar = [
+        cospar_map[str(int(n))]
+        for n in norad_ids
+        if int(n) not in matched_norad and str(int(n)) in cospar_map
+    ]
+    if missing_cospar:
+        extra = fetch_discos_by_cospar(missing_cospar)
+        if not extra.empty:
+            discos = (
+                pd.concat([discos, extra], ignore_index=True)
+                .drop_duplicates(subset=["satno"], keep="first")
+            )
+    return discos

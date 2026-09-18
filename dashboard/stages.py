@@ -1,7 +1,8 @@
-"""Pipeline stage definitions and script mapping."""
+"""Pipeline stage definitions for the SSA dashboard."""
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -14,6 +15,9 @@ STATUS_WARNING = "WARNING"
 STATUS_FAILED = "FAILED"
 STATUS_STOPPED = "STOPPED"
 
+# Ingest → identifiers → process → period → database → evaluation artifacts
+PIPELINE_STEPS: list = []  # filled below after StepDef
+
 
 @dataclass
 class StepDef:
@@ -22,17 +26,14 @@ class StepDef:
     number: int
 
 
-PIPELINE_STEPS: list[StepDef] = [
-    StepDef("ingestion", "API INGESTION", 1),
-    StepDef("prep", "DATA PREPARATION", 2),
-    StepDef("quality", "DATA QUALITY", 3),
-    StepDef("leakage", "LEAKAGE FILTER", 4),
-    StepDef("features", "FEATURE ENGINEERING", 5),
-    StepDef("split", "TRAIN/TEST SPLIT", 6),
-    StepDef("stage1", "STAGE 1 CLASSIFICATION", 7),
-    StepDef("stage2", "STAGE 2 REGRESSION", 8),
-    StepDef("inference", "END-TO-END INFERENCE", 9),
-    StepDef("final", "FINAL RESULTS", 10),
+PIPELINE_STEPS = [
+    StepDef("ingestion", "MMT-9 LIGHT CURVES", 1),
+    StepDef("identifiers", "NORAD → COSPAR (KEEPTRACK)", 2),
+    StepDef("metadata", "TLE + DISCOS (KEEPTRACK-GATED)", 3),
+    StepDef("processing", "QUALITY FILTERING", 4),
+    StepDef("period", "LSP + PDM PERIOD ANALYSIS", 5),
+    StepDef("database", "CENTRAL DATABASE", 6),
+    StepDef("poc", "EVALUATION & ARTIFACTS", 7),  # key retained for log-parser compatibility
 ]
 
 
@@ -43,36 +44,89 @@ class ExecStage:
     script: str
     step_keys: list[str]
     depends_on: list[str] = field(default_factory=list)
+    phase: int = 2
 
 
+# Photometry + evaluation pipeline
 EXEC_STAGES: list[ExecStage] = [
-    ExecStage("fetch", "API Ingestion", "scripts/fetch_data.py", ["ingestion"]),
+    ExecStage(
+        "fetch",
+        "API Ingestion",
+        "scripts/fetch_data.py",
+        ["ingestion", "identifiers", "metadata", "database"],
+        phase=2,
+    ),
+    ExecStage(
+        "periods",
+        "Photometric Processing",
+        "scripts/analyze_periods.py",
+        ["processing", "period", "poc"],
+        depends_on=["fetch"],
+        phase=2,
+    ),
+]
+
+# ML characterization branch (Phase 3)
+PHASE3_EXEC_STAGES: list[ExecStage] = [
     ExecStage(
         "prepare",
-        "Data Preparation",
+        "AI Dataset Preparation",
         "scripts/prepare_dataset.py",
-        ["prep", "quality", "leakage", "features", "split"],
-        depends_on=["fetch"],
+        [],  # ML stage — do not remap Phase 2 "database" stepper on soft warnings
+        depends_on=["periods"],
+        phase=3,
     ),
-    ExecStage("stage1", "Stage 1 Classification", "scripts/train_stage1.py", ["stage1"], depends_on=["prepare"]),
-    ExecStage("stage2", "Stage 2 Regression", "scripts/train_stage2.py", ["stage2"], depends_on=["stage1"]),
+    ExecStage(
+        "stage1",
+        "Stage 1 Ablation",
+        "scripts/run_ablation.py",
+        [],
+        depends_on=["prepare"],
+        phase=3,
+    ),
+    ExecStage(
+        "explain",
+        "Explainability (XAI)",
+        "scripts/explain_models.py",
+        [],
+        depends_on=["stage1"],
+        phase=3,
+    ),
+    ExecStage(
+        "stage2",
+        "Stage 2 Regression",
+        "scripts/train_stage2.py",
+        [],
+        depends_on=["explain"],
+        phase=3,
+    ),
     ExecStage(
         "inference",
         "End-to-End Inference",
         "scripts/run_pipeline.py",
-        ["inference", "final"],
+        [],
         depends_on=["stage2"],
+        phase=3,
     ),
 ]
 
-EXEC_BY_KEY = {e.key: e for e in EXEC_STAGES}
+ALL_EXEC_STAGES = EXEC_STAGES + PHASE3_EXEC_STAGES
+EXEC_BY_KEY = {e.key: e for e in ALL_EXEC_STAGES}
+PHASE2_EXEC_KEYS = [e.key for e in EXEC_STAGES]
+PHASE3_EXEC_KEYS = [e.key for e in PHASE3_EXEC_STAGES]
+# Full SSA pipeline = photometry + ML characterization
+FULL_PIPELINE_KEYS = PHASE2_EXEC_KEYS + PHASE3_EXEC_KEYS
+ALL_EXEC_KEYS = FULL_PIPELINE_KEYS
 
 
 def python_executable() -> str:
-    venv_py = PROJECT_ROOT / ".venv" / "bin" / "python"
-    if venv_py.exists():
-        return str(venv_py)
-    return "python3"
+    """Interpreter for pipeline subprocesses (override with RSO_PYTHON on TrueNAS etc.)."""
+    import sys
+
+    explicit = (os.environ.get("RSO_PYTHON") or "").strip()
+    if explicit:
+        return explicit
+    return sys.executable
 
 
 def script_path(rel: str) -> Path:

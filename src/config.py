@@ -22,8 +22,14 @@ TEST_SIZE = 0.2
 # Column identifiers
 COSPAR_ID_COL = "cospar_id"
 OBJECT_ID_COL = "object_id"
+OBJECT_NAME_COL = "object_name"
 EPOCH_COL = "epoch"
 CLASS_COL = "object_class"
+
+# Light-curve time series (canonical column names)
+LIGHTCURVE_TIME_COL = "time"
+LIGHTCURVE_MAG_COL = "mag"
+LIGHTCURVE_ERR_COL = "mag_err"
 
 # TLE orbital element columns (keplerian)
 ORBITAL_ELEMENT_COLS = [
@@ -45,14 +51,14 @@ STAGE2_PERIOD_TARGET = "true_period"
 STAGE2_TUMBLING_TARGET = "true_tumbling"
 STAGE2_TARGETS = STAGE2_SIZE_TARGETS  # backward-compatible alias for sizing regressors
 
-# Photometric observables allowed as model features
+# Photometric observables allowed as model features (object-level LSP aggregates)
 PHOTOMETRIC_FEATURE_COLS = [
-    "mag_mean",
-    "mag_std",
-    "delta_mag",
-    "estimated_period_sec",
-    "apparent_shape_score",
-    "is_tumbling",
+    "track_count",
+    "periodic_fraction",
+    "median_period_sec",
+    "period_scatter",
+    "median_amplitude",
+    "is_tumbling_consistent",
 ]
 
 # Explicit ground-truth columns blocked from feature matrix

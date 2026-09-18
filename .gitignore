@@ -18,3 +18,4 @@ results/*
 !results/.gitkeep
 results/pipeline_runs/*
 !results/pipeline_runs/.gitkeep
+graphify-out/

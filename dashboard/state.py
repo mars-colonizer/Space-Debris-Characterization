@@ -6,9 +6,12 @@ import threading
 import time
 from typing import Any
 
-from dashboard.stages import EXEC_BY_KEY, PIPELINE_STEPS, PROJECT_ROOT, STATUS_WAITING
-
-ALL_EXEC_KEYS = ["fetch", "prepare", "stage1", "stage2", "inference"]
+from dashboard.stages import (
+    EXEC_BY_KEY,
+    PIPELINE_STEPS,
+    PROJECT_ROOT,
+    STATUS_WAITING,
+)
 
 
 def _data_mode_label() -> str:
@@ -42,7 +45,6 @@ class PipelineStateManager:
             self.runner = None
 
     def reset(self) -> None:
-        """Clear in-memory pipeline state (alias for reset_idle)."""
         self.reset_idle()
 
     def begin_run(self, exec_keys: list[str]) -> bool:
@@ -74,7 +76,7 @@ class PipelineStateManager:
             self.stage_status.update(runner.stage_status)
             if runner.current_exec_key:
                 self.current_exec_key = EXEC_BY_KEY[runner.current_exec_key].label
-            running = [k for k, v in runner.stage_status.items() if v == "RUNNING" and not k.startswith("_")]
+            running = [k for k, v in runner.stage_status.items() if v == "RUNNING"]
             if running:
                 self.current_step_key = running[-1]
             if runner.run_dir:
@@ -84,7 +86,13 @@ class PipelineStateManager:
         from dashboard.result_loader import parse_inference_from_log
 
         with self._lock:
-            self.pipeline_status = result.get("status", "FAILED")
+            status = result.get("status") or "STOPPED"
+            if status == "FAILED":
+                status = "STOPPED"
+            # Terminal statuses always leave RUNNING so controls unlock.
+            if status not in ("COMPLETED", "STOPPED", "IDLE"):
+                status = "STOPPED"
+            self.pipeline_status = status
             self.stage_status = result.get("stage_status", self.stage_status)
             self.warnings = result.get("warnings", [])
             self.errors = result.get("errors", [])
@@ -98,6 +106,8 @@ class PipelineStateManager:
                 self.inference_result = parse_inference_from_log(result["inference_log"])
             if result.get("run_dir"):
                 self.active_run_dir = result["run_dir"]
+            self.current_exec_key = None
+            self.current_step_key = None
             self.runner = None
 
     def stop_requested(self) -> None:
@@ -133,21 +143,43 @@ class PipelineStateManager:
             return self.pipeline_status == "RUNNING"
 
     def check_dependencies(self, exec_key: str) -> str | None:
-        raw_tle = PROJECT_ROOT / "data" / "raw" / "tle_history.csv"
-        raw_discos = PROJECT_ROOT / "data" / "raw" / "discos_metadata.csv"
-        train = PROJECT_ROOT / "data" / "processed" / "train.csv"
-        stage1 = PROJECT_ROOT / "models" / "stage1_lightgbm.joblib"
+        db = PROJECT_ROOT / "data" / "database" / "rso_poc.db"
+        mmt = PROJECT_ROOT / "data" / "raw" / "mmt_lightcurves" / "mmt_lightcurves.csv"
+        matrix = PROJECT_ROOT / "data" / "processed" / "phase3_feature_matrix.csv"
+        fused = PROJECT_ROOT / "models" / "stage1" / "lgbm_fused.pkl"
+        stage2_dir = PROJECT_ROOT / "models" / "stage2"
+        has_stage2 = stage2_dir.exists() and any(stage2_dir.glob("regressor_*.pkl"))
         deps = {
-            "prepare": (raw_tle.exists() and raw_discos.exists(), "Run Ingestion first (raw CSVs missing)."),
-            "stage1": (train.exists(), "Run Data Preparation first (train.csv missing)."),
-            "stage2": (stage1.exists(), "Run Stage 1 first (models missing)."),
-            "inference": (stage1.exists(), "Run Stage 1 and Stage 2 first."),
+            "fetch": (True, ""),
+            "periods": (
+                db.exists() or mmt.exists(),
+                "Run API Ingestion first (no light curves in database).",
+            ),
+            "prepare": (
+                db.exists() or mmt.exists(),
+                "Run photometry pipeline first (database or MMT light curves missing).",
+            ),
+            "stage1": (
+                matrix.exists(),
+                "Run AI Dataset Preparation first (phase3_feature_matrix.csv missing).",
+            ),
+            "explain": (
+                fused.exists(),
+                "Run Stage 1 Ablation first (models/stage1/lgbm_fused.pkl missing).",
+            ),
+            "stage2": (
+                matrix.exists(),
+                "Run AI Dataset Preparation first (phase3_feature_matrix.csv missing).",
+            ),
+            "inference": (
+                fused.exists() and has_stage2,
+                "Run Stage 1 Ablation and Stage 2 first (fused/regressor models missing).",
+            ),
         }
         ok, msg = deps.get(exec_key, (True, ""))
         return None if ok else msg
 
     def can_delete_run(self, run_id: str) -> tuple[bool, str | None]:
-        """Return (allowed, error_message)."""
         if self.is_running() and self.active_run_dir and run_id in self.active_run_dir:
             return False, "Cannot delete the run directory while pipeline is RUNNING."
         return True, None

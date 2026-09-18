@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Run end-to-end Stage 1 → Stage 2 pipeline on a test object."""
+"""End-to-end inference using Phase 3 fused LightGBM + class-conditioned mass regressor."""
 
 from __future__ import annotations
 
 import argparse
-import json
+import re
 import sys
+import time
 from pathlib import Path
 
 import joblib
@@ -14,119 +15,131 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.config import (
-    CLASS_COL,
-    COSPAR_ID_COL,
-    DATA_PROCESSED,
-    MODELS_DIR,
-    NON_FEATURE_COLUMNS,
-    STAGE2_PERIOD_TARGET,
-    STAGE2_SHAPE_TARGET,
-    STAGE2_SIZE_TARGETS,
-    STAGE2_TUMBLING_TARGET,
-    STAGE2_TARGETS,
-)
-from src.models.pipeline import RSOPipeline
-from src.models.stage1_classifier import load_stage1_model, predict_with_confidence
+from src.config import CLASS_COL, COSPAR_ID_COL, DATA_PROCESSED, MODELS_DIR
 from src.utils import terminal as term
 
-STAGE1_NAME = "lightgbm"
-STEPS = 8
+FUSED_MODEL = MODELS_DIR / "stage1" / "lgbm_fused.pkl"
+MATRIX_PATH = DATA_PROCESSED / "phase3_feature_matrix.csv"
+FILL_VALUE = -1.0
+STEPS = 5
+# Prefer classes that have a Stage 2 mass regressor for the dashboard demo object.
+_PREFERRED_CLASSES = ("Payload", "Rocket Body")
 
-LABEL_COLS = STAGE2_SIZE_TARGETS + [
-    STAGE2_SHAPE_TARGET, STAGE2_PERIOD_TARGET, STAGE2_TUMBLING_TARGET,
-    "length", "width", "height", "mass", "shape",
-]
+
+def _safe_class_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(name).strip().lower()).strip("_") or "class"
 
 
-def _feature_row(df: pd.DataFrame) -> pd.DataFrame:
-    drop_cols = NON_FEATURE_COLUMNS + [CLASS_COL] + [c for c in LABEL_COLS if c in df.columns]
-    return df[[c for c in df.columns if c not in drop_cols]]
+def _pick_sample(df: pd.DataFrame) -> pd.DataFrame:
+    """Prefer an object whose true class has a trained mass regressor."""
+    if CLASS_COL not in df.columns:
+        return df.iloc[[0]].copy()
+    for cls in _PREFERRED_CLASSES:
+        reg = MODELS_DIR / "stage2" / f"regressor_{_safe_class_name(cls)}.pkl"
+        if not reg.is_file():
+            continue
+        subset = df[df[CLASS_COL].astype(str) == cls]
+        if "mass" in subset.columns:
+            subset = subset[pd.to_numeric(subset["mass"], errors="coerce").notna()]
+        if len(subset):
+            return subset.iloc[[0]].copy()
+    return df.iloc[[0]].copy()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run end-to-end RSO inference")
+    parser = argparse.ArgumentParser(description="Run end-to-end RSO inference (Phase 3)")
     term.add_verbosity_args(parser)
     args = parser.parse_args()
     term.configure_from_args(args)
     timer = term.ScriptTimer()
+    t0 = time.time()
 
-    term.banner("PHASE 2 — END-TO-END RSO INFERENCE")
+    term.banner("PHASE 3 — END-TO-END RSO INFERENCE")
 
     try:
-        test_path = DATA_PROCESSED / "test.csv"
-        if not test_path.exists():
-            term.fail("INFERENCE FAILED", "test.csv not found", ["Run scripts/prepare_dataset.py first"])
-        if not (MODELS_DIR / f"stage1_{STAGE1_NAME}.joblib").exists():
-            term.fail("INFERENCE FAILED", "Trained models not found", ["Run train_stage1.py and train_stage2.py first"])
+        if not MATRIX_PATH.is_file():
+            term.fail(
+                "INFERENCE FAILED",
+                f"{MATRIX_PATH} not found",
+                ["Run scripts/prepare_dataset.py first"],
+            )
+        if not FUSED_MODEL.is_file():
+            term.fail(
+                "INFERENCE FAILED",
+                f"{FUSED_MODEL} not found",
+                ["Run scripts/run_ablation.py first"],
+            )
 
-        test_df = pd.read_csv(test_path)
-        sample = test_df.iloc[[0]]
-        cospar = sample[COSPAR_ID_COL].iloc[0]
+        term.step(1, STEPS, "Loading fused LightGBM classifier...")
+        bundle = joblib.load(FUSED_MODEL)
+        model = bundle["model"]
+        le = bundle["label_encoder"]
+        feature_names = list(bundle["feature_names"])
+        fill = float(bundle.get("fill_value", FILL_VALUE))
+        term.ok(f"Loaded {FUSED_MODEL.relative_to(PROJECT_ROOT)}")
+
+        term.step(2, STEPS, "Selecting test object from Phase 3 matrix...")
+        df = pd.read_csv(MATRIX_PATH)
+        sample = _pick_sample(df)
+        cospar = sample[COSPAR_ID_COL].iloc[0] if COSPAR_ID_COL in sample.columns else "—"
         true_class = sample[CLASS_COL].iloc[0] if CLASS_COL in sample.columns else None
-
-        term.info("Input object:")
+        # Dashboard log parser keys (keep wording stable).
         term.info(f"COSPAR ID: {cospar}", indent=4)
-        if true_class:
+        if true_class is not None:
             term.info(f"True class: {true_class}", indent=4)
-        term.line()
 
-        term.step(1, STEPS, "Loading trained preprocessing pipeline...")
-        pipeline = RSOPipeline.load(MODELS_DIR, stage1_name=STAGE1_NAME)
-        term.ok("Feature schema loaded from saved models")
-
-        term.step(2, STEPS, "Loading Stage 1 classifier...")
-        term.ok(f"Loaded models/stage1_{STAGE1_NAME}.joblib")
-
-        term.step(3, STEPS, "Preparing input features...")
-        X = _feature_row(sample)
-        term.ok(f"Feature count: {term.fmt_n(X.shape[1])}")
-
-        term.step(4, STEPS, "Running Stage 1 classification...")
-        stage1 = load_stage1_model(STAGE1_NAME, MODELS_DIR)
-        label_encoder = joblib.load(MODELS_DIR / "stage1_label_encoder.joblib")
-        y_pred, confidence = predict_with_confidence(stage1, X, label_encoder)
-        predicted_class = y_pred[0]
-        conf = float(confidence[0]) if confidence[0] == confidence[0] else None
+        term.step(3, STEPS, "Running Stage 1 classification...")
+        X = sample[feature_names].apply(pd.to_numeric, errors="coerce").fillna(fill)
+        pred_idx = int(model.predict(X)[0])
+        predicted_class = str(le.inverse_transform([pred_idx])[0])
+        conf = None
+        if hasattr(model, "predict_proba"):
+            proba = model.predict_proba(X)[0]
+            conf = float(proba[pred_idx]) * 100.0
         term.ok(f"Predicted class: {predicted_class}")
         if conf is not None:
-            term.ok(f"Confidence: {conf * 100:.2f}%")
+            term.ok(f"Confidence: {conf:.2f}%")
 
-        term.step(5, STEPS, "Selecting Stage 2 class-conditioned models...")
-        stage2_key = pipeline.stage2_class_map.get(predicted_class)
-        if predicted_class in pipeline.stage2_models and stage2_key:
-            term.ok(f"Selected model: models/stage2/{stage2_key}.joblib")
+        term.step(4, STEPS, "Running Stage 2 mass regression...")
+        reg_path = MODELS_DIR / "stage2" / f"regressor_{_safe_class_name(predicted_class)}.pkl"
+        mass_pred = None
+        target_col = "mass"
+        if reg_path.is_file():
+            reg_bundle = joblib.load(reg_path)
+            reg = reg_bundle["model"]
+            reg_feats = list(reg_bundle.get("feature_names", feature_names))
+            target_col = str(reg_bundle.get("target_col", "mass"))
+            Xr = sample.reindex(columns=reg_feats).apply(pd.to_numeric, errors="coerce").fillna(fill)
+            mass_pred = float(reg.predict(Xr)[0])
+            term.ok(f"Selected model: {reg_path.relative_to(PROJECT_ROOT)}")
+            # Parseable line for dashboard: "Mass: 123.4567 kg"
+            term.info(f"Mass: {mass_pred:.4f} kg", indent=4)
         else:
-            term.warn(f"No Stage 2 model available for class '{predicted_class}'")
+            term.warn(f"No Stage 2 regressor for class '{predicted_class}' ({reg_path.name})")
+            term.info("Mass: n/a", indent=4)
 
-        term.step(6, STEPS, "Estimating physical properties...")
-        result = pipeline.predict_rso(X)
-        dims = result.get("dimensions") or {}
-        for dim in ("length", "width", "height"):
-            val = dims.get(dim)
-            if val is not None:
-                term.info(f"{dim.capitalize()}: {val:.4f} m", indent=4)
+        # Photometric cues from the feature matrix (not Stage 2 outputs).
+        if "median_period_sec" in sample.columns and pd.notna(sample["median_period_sec"].iloc[0]):
+            term.info(f"Spin period: {float(sample['median_period_sec'].iloc[0]):.2f} s", indent=4)
+        else:
+            term.info("Spin period: n/a", indent=4)
+        if "is_tumbling_consistent" in sample.columns and pd.notna(sample["is_tumbling_consistent"].iloc[0]):
+            tumble = "yes" if int(sample["is_tumbling_consistent"].iloc[0]) else "no"
+            term.info(f"Tumbling: {tumble}", indent=4)
+        else:
+            term.info("Tumbling: n/a", indent=4)
 
-        term.step(7, STEPS, "Estimating shape and rotation...")
-        if result.get("shape"):
-            term.info(f"Shape: {result['shape']}", indent=4)
-        rot = result.get("rotation") or {}
-        if rot.get("period_sec") is not None:
-            term.info(f"Spin period: {rot['period_sec']:.2f} s", indent=4)
-        if rot.get("tumbling"):
-            term.info(f"Tumbling: {rot['tumbling']}", indent=4)
-
-        term.step(8, STEPS, "Comparing with ground truth (if available)...")
-        for dim, col in zip(("length", "width", "height"), STAGE2_SIZE_TARGETS):
-            pred = dims.get(dim)
-            actual = sample[col].iloc[0] if col in sample.columns else None
-            if pred is not None and actual is not None and pd.notna(actual):
-                term.info(f"{dim}: pred={pred:.4f} true={float(actual):.4f}", indent=4)
+        term.step(5, STEPS, "Comparing with ground truth (if available)...")
+        if true_class is not None:
+            term.info(f"class: pred={predicted_class} true={true_class}", indent=4)
+        if mass_pred is not None and target_col in sample.columns and pd.notna(sample[target_col].iloc[0]):
+            term.info(
+                f"{target_col}: pred={mass_pred:.4f} true={float(sample[target_col].iloc[0]):.4f}",
+                indent=4,
+            )
 
         term.banner("END-TO-END INFERENCE COMPLETE")
-        term.info(f"Latency: {result.get('latency_seconds', 0):.4f} s")
-        if term.VERBOSE:
-            term.line(json.dumps(result, indent=2, default=str))
+        term.info(f"Latency: {time.time() - t0:.4f} s")
         timer.print_total()
 
     except Exception as exc:

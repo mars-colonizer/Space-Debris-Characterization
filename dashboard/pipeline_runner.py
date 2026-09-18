@@ -5,20 +5,22 @@ from __future__ import annotations
 import os
 import queue
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
 from typing import Callable
 
 from dashboard.log_parser import (
+    _is_error_line,
     apply_log_line,
     mark_exec_complete,
     mark_exec_failed,
     mark_exec_start,
     sanitize_log_line,
 )
-from dashboard.result_loader import RUNS_DIR, save_run_summary
-from dashboard.stages import EXEC_BY_KEY, PROJECT_ROOT, python_executable, script_path
+from dashboard.result_loader import RUNS_DIR, invalidate_metrics_cache, save_run_summary
+from dashboard.stages import EXEC_BY_KEY, PROJECT_ROOT, script_path
 
 
 class LogBroadcaster:
@@ -44,6 +46,9 @@ class LogBroadcaster:
 
     def publish_status(self, status: dict) -> None:
         self._publish({"type": "status", "data": status})
+
+    def publish_metrics_refresh(self) -> None:
+        self._publish({"type": "metrics_refresh"})
 
     def _publish(self, msg: dict) -> None:
         with self._lock:
@@ -102,16 +107,6 @@ class PipelineRunner:
                 self._proc.kill()
 
     def poll(self) -> dict | None:
-        while True:
-            try:
-                line = self.log_queue.get_nowait()
-            except queue.Empty:
-                break
-            if line is None:
-                continue
-            self.logs.append(line)
-            self.on_log(line)
-
         try:
             return self.done_queue.get_nowait()
         except queue.Empty:
@@ -124,64 +119,119 @@ class PipelineRunner:
     def _emit(self, line: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
         formatted = f"{ts} {sanitize_log_line(line)}"
-        self.log_queue.put(formatted)
+        self.logs.append(formatted)
+        self.on_log(formatted)
 
     def _run(self) -> None:
-        from dashboard.stages import PIPELINE_STEPS, STATUS_WAITING
+        from dashboard.stages import PIPELINE_STEPS, STATUS_STOPPED, STATUS_WAITING
 
         self.stage_status = {s.key: STATUS_WAITING for s in PIPELINE_STEPS}
         overall_ok = True
-        self._emit("[INFO] Starting Phase 2 pipeline execution")
-        self.on_status()
-
-        for exec_key in self.exec_keys:
-            if self._stop.is_set():
+        try:
+            if not self.exec_keys:
+                self.failed_error = "No pipeline stages scheduled"
+                self._emit("[WARNING] No pipeline stages to run — marking as stopped")
                 self.done_queue.put(self._result("STOPPED"))
+                self.on_status()
                 return
 
-            stage = EXEC_BY_KEY[exec_key]
-            self.current_exec_key = exec_key
-            mark_exec_start(self.stage_status, stage.step_keys)
-            self._emit(f"[INFO] >>> Starting {stage.label}: {stage.script}")
+            self._emit("[INFO] End-to-end SSA pipeline execution started")
             self.on_status()
 
-            rc = self._run_script(stage.script, stage.label)
-            if rc != 0:
-                overall_ok = False
-                mark_exec_failed(self.stage_status, stage.step_keys)
-                self.failed_stage = stage.label
-                self.failed_error = self.errors[-1] if self.errors else f"Exit code {rc}"
-                self._emit(f"[ERROR] Pipeline stopped at {stage.label}")
-                break
+            for exec_key in self.exec_keys:
+                if self._stop.is_set():
+                    self._mark_running_steps_stopped()
+                    self.done_queue.put(self._result("STOPPED"))
+                    self.on_status()
+                    return
 
-            had_warnings = any("[WARNING]" in w for w in self.warnings)
-            mark_exec_complete(self.stage_status, stage.step_keys, had_warnings)
-            self._emit(f"[OK] Completed {stage.label}")
+                stage = EXEC_BY_KEY[exec_key]
+                self.current_exec_key = exec_key
+                mark_exec_start(self.stage_status, stage.step_keys)
+                self._emit(f"[INFO] >>> Starting {stage.label}: {stage.script}")
+                self.on_status()
+
+                # Only count warnings emitted during this stage (not earlier stages).
+                stage_warning_anchor = len(self.warnings)
+                rc = self._run_script(stage.script, stage.label)
+                if self._stop.is_set():
+                    self._mark_running_steps_stopped()
+                    overall_ok = False
+                    if not self.failed_error:
+                        self.failed_error = "Pipeline stopped by user"
+                    self._emit(f"[WARNING] Pipeline stopped during {stage.label}")
+                    break
+
+                if rc != 0:
+                    overall_ok = False
+                    mark_exec_failed(self.stage_status, stage.step_keys)
+                    self._mark_running_steps_stopped()
+                    self.failed_stage = stage.label
+                    self.failed_error = self.errors[-1] if self.errors else f"Exit code {rc}"
+                    self._emit(f"[ERROR] Pipeline stopped at {stage.label}")
+                    break
+
+                stage_warnings = self.warnings[stage_warning_anchor:]
+                had_warnings = any("[WARNING]" in w for w in stage_warnings)
+                mark_exec_complete(self.stage_status, stage.step_keys, had_warnings)
+                self._emit(f"[OK] Completed {stage.label}")
+                self.on_status()
+
+            # Any unsuccessful finish (error, abort, empty run) → STOPPED.
+            status = "COMPLETED" if overall_ok and not self._stop.is_set() else "STOPPED"
+            if status == "COMPLETED":
+                from dashboard.stages import STATUS_COMPLETE, STATUS_FAILED, STATUS_WARNING
+
+                for key, val in self.stage_status.items():
+                    if val not in (STATUS_FAILED, STATUS_COMPLETE, STATUS_WARNING, STATUS_STOPPED):
+                        self.stage_status[key] = STATUS_COMPLETE
+                self._emit("[OK] End-to-End Pipeline Execution Complete")
+            else:
+                self._mark_running_steps_stopped()
+                if not self.failed_error:
+                    self.failed_error = "Pipeline stopped"
+                self._emit("[WARNING] Pipeline marked as stopped")
+
+            elapsed = time.time() - (self.start_time or time.time())
+            self._emit(f"[INFO] Pipeline finished with status: {status} ({elapsed:.2f}s)")
+
+            summary = {
+                "status": status,
+                "start_time": datetime.fromtimestamp(self.start_time or time.time()).isoformat(),
+                "end_time": datetime.now().isoformat(),
+                "duration_sec": round(elapsed, 2),
+                "stage_status": self.stage_status,
+                "warnings": self.warnings[-50:],
+                "errors": self.errors,
+                "failed_stage": self.failed_stage,
+                "failed_error": self.failed_error,
+                "exec_keys": self.exec_keys,
+            }
+            save_run_summary(self.run_dir, summary, self.logs)
+            self.done_queue.put(self._result(status, summary))
+            self.on_status()
+        except Exception as exc:
+            self.failed_error = str(exc)
+            self.errors.append(f"[ERROR] {exc}")
+            self._mark_running_steps_stopped()
+            self._emit(f"[ERROR] Pipeline aborted: {exc}")
+            try:
+                self.done_queue.put(self._result("STOPPED"))
+            except queue.Full:
+                pass
             self.on_status()
 
-        status = "COMPLETED" if overall_ok and not self._stop.is_set() else (
-            "STOPPED" if self._stop.is_set() else "FAILED"
-        )
-        elapsed = time.time() - (self.start_time or time.time())
-        self._emit(f"[INFO] Pipeline finished with status: {status} ({elapsed:.2f}s)")
+    def _mark_running_steps_stopped(self) -> None:
+        from dashboard.stages import STATUS_RUNNING, STATUS_STOPPED
 
-        summary = {
-            "status": status,
-            "start_time": datetime.fromtimestamp(self.start_time or time.time()).isoformat(),
-            "end_time": datetime.now().isoformat(),
-            "duration_sec": round(elapsed, 2),
-            "stage_status": self.stage_status,
-            "warnings": self.warnings[-50:],
-            "errors": self.errors,
-            "failed_stage": self.failed_stage,
-            "failed_error": self.failed_error,
-            "exec_keys": self.exec_keys,
-        }
-        save_run_summary(self.run_dir, summary, self.logs)
-        self.done_queue.put(self._result(status, summary))
-        self.on_status()
+        for key, val in list(self.stage_status.items()):
+            if val == STATUS_RUNNING:
+                self.stage_status[key] = STATUS_STOPPED
 
     def _result(self, status: str, summary: dict | None = None) -> dict:
+        # Normalize legacy FAILED → STOPPED for the dashboard badge.
+        if status == "FAILED":
+            status = "STOPPED"
         return {
             "status": status,
             "stage_status": self.stage_status,
@@ -189,7 +239,11 @@ class PipelineRunner:
             "errors": self.errors,
             "logs": self.logs,
             "failed_stage": self.failed_stage,
-            "failed_error": self.failed_error if status != "STOPPED" else "Pipeline stopped by user",
+            "failed_error": (
+                self.failed_error
+                if status != "STOPPED" or self.failed_error
+                else "Pipeline stopped"
+            ),
             "inference_log": "".join(self.inference_log),
             "run_dir": str(self.run_dir),
             "summary": summary,
@@ -197,10 +251,16 @@ class PipelineRunner:
         }
 
     def _run_script(self, script_rel: str, label: str) -> int:
-        cmd = [python_executable(), str(script_path(script_rel))]
-        self._emit(f"[INFO] Executing: {' '.join(cmd[:2])} {script_rel}")
+        # Use the dashboard's interpreter so subprocesses share its venv packages.
+        cmd = [sys.executable, str(script_path(script_rel))]
+        self._emit(f"[INFO] Executing: {' '.join(cmd)}")
 
         try:
+            env = {
+                **os.environ,
+                "PYTHONUNBUFFERED": "1",
+                "PYTHONPATH": str(PROJECT_ROOT),
+            }
             self._proc = subprocess.Popen(
                 cmd,
                 cwd=str(PROJECT_ROOT),
@@ -208,7 +268,7 @@ class PipelineRunner:
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                env=env,
             )
         except OSError as exc:
             msg = f"[ERROR] Failed to start {script_rel}: {exc}"
@@ -230,7 +290,11 @@ class PipelineRunner:
             apply_log_line(line, self.stage_status, self.warnings)
             self.on_status()
 
-            if "[ERROR]" in line or "FAILED" in line:
+            if "INGESTION COMPLETE" in line or "PHOTOMETRIC PROCESSING COMPLETE" in line:
+                invalidate_metrics_cache()
+                broadcaster.publish_metrics_refresh()
+
+            if _is_error_line(line):
                 self.errors.append(line.strip())
 
             if "run_pipeline.py" in script_rel or label == "End-to-End Inference":
