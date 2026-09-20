@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI-Enabled Space Situational Awareness</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/static/terminal.css" />
+</head>
+<body class="bg-gray-50 text-gray-900 min-h-screen">
+  <header class="bg-slate-900 text-white shadow-lg">
+    <div class="max-w-7xl mx-auto px-4 py-5">
+      <div class="text-center mb-4">
+        <h1 class="text-2xl md:text-3xl font-bold tracking-tight">AI-Enabled Space Situational Awareness</h1>
+        <p class="text-sm md:text-base text-gray-400 font-medium mt-2">Explainable Classification and Characterization of Resident Space Objects</p>
+        <p class="text-xs text-gray-500 font-mono mt-1">MMT-9 → KeepTrack COSPAR → TLE / DISCOS → Astropy FAP Photometry → Multiclass &amp; Regression ML</p>
+      </div>
+      <div class="flex flex-wrap justify-center items-center gap-2">
+        <span class="text-xs text-slate-400 uppercase tracking-wide mr-2">Data mode:</span>
+        <div id="mode-switch" class="inline-flex rounded-lg bg-slate-800 p-1 border border-slate-700">
+          <button type="button" data-mode="SYNTHETIC" class="mode-btn px-3 py-1.5 text-xs font-semibold rounded-md transition">
+            Synthetic
+          </button>
+          <button type="button" data-mode="ACTUAL" class="mode-btn px-3 py-1.5 text-xs font-semibold rounded-md transition">
+            Live / Actual
+          </button>
+        </div>
+        <span id="mode-hint" class="text-xs text-slate-400 hidden md:inline">MMT-9 · KeepTrack · Space-Track · DISCOS</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-7xl mx-auto px-4 py-6 space-y-6">
+    <!-- Status bar -->
+    <section class="card flex flex-wrap items-center gap-4 justify-between">
+      <div class="flex flex-wrap items-center gap-3">
+        <span id="status-badge" class="status-idle text-white text-xs font-bold px-3 py-1 rounded-full uppercase">IDLE</span>
+        <div class="text-sm"><span class="text-gray-500">Started:</span> <span id="started-at">—</span></div>
+        <div class="text-sm"><span class="text-gray-500">Elapsed:</span> <span id="elapsed">—</span></div>
+        <div class="text-sm"><span class="text-gray-500">Current:</span> <span id="current-stage">—</span></div>
+      </div>
+      <div id="error-banner" class="hidden w-full bg-red-50 border border-red-200 text-red-800 text-sm rounded p-3"></div>
+    </section>
+
+    <!-- Controls -->
+    <section class="card">
+      <h2 class="text-sm font-semibold text-gray-500 uppercase mb-3">End-to-End Pipeline Control</h2>
+      <p class="text-xs text-gray-500 mb-3">Unified SSA pipeline: ingest MMT-9 light curves, resolve COSPAR via KeepTrack, gate Space-Track TLE and DISCOS metadata, run Astropy FAP photometry, then train explainable classification and characterization models.</p>
+      <div class="flex flex-wrap gap-3 mb-4">
+        <button id="btn-run-full" class="bg-blue-600 hover:bg-blue-700 text-white font-semibold px-4 py-2 rounded shadow text-sm">
+          Run Full SSA Pipeline
+        </button>
+        <button id="btn-stop" disabled class="bg-red-600 hover:bg-red-700 disabled:opacity-40 text-white font-semibold px-4 py-2 rounded shadow text-sm">
+          Stop
+        </button>
+        <button id="btn-reset-all" class="bg-orange-600 hover:bg-orange-700 disabled:opacity-40 text-white font-semibold px-4 py-2 rounded shadow text-sm">
+          Reset / Clear All Data
+        </button>
+      </div>
+      <div class="flex flex-wrap gap-2">
+        <button data-stage="fetch" class="stage-btn bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-medium px-3 py-2 rounded border">Ingestion</button>
+        <button data-stage="periods" class="stage-btn bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-medium px-3 py-2 rounded border">Photometric Processing</button>
+      </div>
+    </section>
+
+    <!-- Stepper + Terminal -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <section class="card lg:col-span-1">
+        <h2 class="text-sm font-semibold text-gray-500 uppercase mb-3">Pipeline Progress</h2>
+        <ol id="stepper" class="space-y-2 text-sm"></ol>
+      </section>
+      <section class="card lg:col-span-2">
+        <div class="flex justify-between items-center mb-2">
+          <h2 class="text-sm font-semibold text-gray-500 uppercase">Live Terminal</h2>
+          <button id="btn-clear-log" class="text-xs text-gray-500 hover:text-gray-800">Clear view</button>
+        </div>
+        <div id="terminal-log"></div>
+      </section>
+    </div>
+
+    <!-- Pipeline metric cards -->
+    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+      <section class="card">
+        <h3 class="font-semibold mb-2">1. MMT-9 Light Curves</h3>
+        <p class="text-xs text-gray-400 mb-2">Always fetched first — drives object selection</p>
+        <div id="ingestion-content" class="text-sm text-gray-600 space-y-1">No data yet.</div>
+      </section>
+      <section class="card">
+        <h3 class="font-semibold mb-2">2. KeepTrack COSPAR</h3>
+        <p class="text-xs text-gray-400 mb-2">NORAD → International Designator for MMT objects</p>
+        <div id="identifiers-content" class="text-sm text-gray-600 space-y-1">Run ingestion first.</div>
+      </section>
+      <section class="card">
+        <h3 class="font-semibold mb-2">3. TLE + DISCOS (gated)</h3>
+        <p class="text-xs text-gray-400 mb-2">Space-Track + DISCOS only when KeepTrack COSPAR resolves</p>
+        <div id="metadata-content" class="text-sm text-gray-600 space-y-1">Awaiting KeepTrack resolution.</div>
+      </section>
+      <section class="card">
+        <h3 class="font-semibold mb-2">4. Central Database</h3>
+        <p class="text-xs text-gray-400 mb-2">Object index · light curves · periodograms</p>
+        <div id="database-content" class="text-sm text-gray-600 space-y-1">Database empty.</div>
+      </section>
+      <section class="card md:col-span-2">
+        <h3 class="font-semibold mb-2">5. Period Analysis (LSP + PDM)</h3>
+        <p class="text-xs text-gray-400 mb-2">Quality filter → Lomb–Scargle → PDM validation → phase fold</p>
+        <div id="period-content" class="text-sm text-gray-600">Run photometric processing to populate.</div>
+      </section>
+      <section class="card">
+        <h3 class="font-semibold mb-2">6. Evaluation Artifacts</h3>
+        <p class="text-xs text-gray-400 mb-2">Periodogram &amp; diagnostic plots · folded curves</p>
+        <div id="artifacts-summary" class="text-sm text-gray-600 mb-3">No artifacts yet.</div>
+      </section>
+    </div>
+
+    <!-- Artifact gallery -->
+    <section class="card">
+      <h2 class="text-sm font-semibold text-gray-500 uppercase mb-3">Photometric Analysis Gallery</h2>
+      <div id="artifact-gallery" class="artifact-grid">
+        <p class="text-sm text-gray-400 col-span-full">Plots appear after photometric processing completes.</p>
+      </div>
+    </section>
+
+    <!-- Phase 3: AI Characterization -->
+    <section class="card border-indigo-100" id="phase3-section">
+      <div class="flex flex-wrap items-start justify-between gap-3 mb-4">
+        <div>
+          <h2 class="text-lg font-semibold text-slate-800">Phase 3: AI Characterization</h2>
+          <p class="text-xs text-gray-500 mt-1">Ablation study · GroupKFold explainability · class-conditioned mass regression</p>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <button id="btn-run-phase3" class="bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-medium px-3 py-2 rounded">Run Full SSA Pipeline</button>
+          <button data-stage="prepare" class="stage-btn phase3-btn bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-medium px-3 py-2 rounded border">Prepare</button>
+          <button data-stage="stage1" class="stage-btn phase3-btn bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-medium px-3 py-2 rounded border">Stage 1</button>
+          <button data-stage="explain" class="stage-btn phase3-btn bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-medium px-3 py-2 rounded border">Explain</button>
+          <button data-stage="stage2" class="stage-btn phase3-btn bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-medium px-3 py-2 rounded border">Stage 2</button>
+          <button data-stage="inference" class="stage-btn phase3-btn bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-medium px-3 py-2 rounded border">Inference</button>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 xl:grid-cols-2 gap-6">
+        <div class="rounded-lg border border-slate-200 bg-slate-50/60 p-4">
+          <h3 class="font-semibold text-slate-800 mb-1">Stage 1 Classification</h3>
+          <p class="text-xs text-gray-500 mb-3">Macro F1 — Orbital vs Fused (GroupKFold on launch_group)</p>
+          <div id="phase3-ablation-content" class="overflow-x-auto text-sm text-gray-600">Loading ablation metrics…</div>
+        </div>
+
+        <div class="rounded-lg border border-slate-200 bg-slate-50/60 p-4">
+          <h3 class="font-semibold text-slate-800 mb-1">Stage 2 Physical Characterization</h3>
+          <p class="text-xs text-gray-500 mb-3">Mass regression — RandomForest LOOCV per object class</p>
+          <div id="phase3-stage2-content" class="text-sm text-gray-600">Loading Stage 2 metrics…</div>
+        </div>
+
+        <div class="xl:col-span-2 rounded-lg border border-slate-200 bg-slate-50/60 p-4">
+          <h3 class="font-semibold text-slate-800 mb-1">Explainability (XAI)</h3>
+          <p class="text-xs text-gray-500 mb-3">Out-of-fold confusion matrix and SHAP feature importance (fused LightGBM)</p>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4" id="phase3-xai-gallery">
+            <figure class="bg-white border border-slate-200 rounded overflow-hidden relative min-h-[12rem]">
+              <figcaption class="text-xs font-medium text-slate-600 px-3 py-2 border-b border-slate-100">Confusion Matrix</figcaption>
+              <a id="phase3-cm-link" href="/phase3_images/confusion_matrix.png" target="_blank" rel="noopener" class="block">
+                <img id="phase3-cm-img" src="/phase3_images/confusion_matrix.png" alt="Confusion matrix"
+                     class="w-full h-auto object-contain bg-white" loading="lazy" data-xai="cm" />
+              </a>
+              <div id="phase3-cm-fallback" class="hidden absolute inset-x-0 bottom-0 top-8 flex items-center justify-center px-4 text-center text-xs text-slate-400 bg-slate-50">
+                Confusion matrix not available yet — run <code class="mx-1">scripts/explain_models.py</code>
+              </div>
+            </figure>
+            <figure class="bg-white border border-slate-200 rounded overflow-hidden relative min-h-[12rem]">
+              <figcaption class="text-xs font-medium text-slate-600 px-3 py-2 border-b border-slate-100">SHAP Feature Importance</figcaption>
+              <a id="phase3-shap-link" href="/phase3_images/shap_feature_importance.png" target="_blank" rel="noopener" class="block">
+                <img id="phase3-shap-img" src="/phase3_images/shap_feature_importance.png" alt="SHAP feature importance"
+                     class="w-full h-auto object-contain bg-white" loading="lazy" data-xai="shap" />
+              </a>
+              <div id="phase3-shap-fallback" class="hidden absolute inset-x-0 bottom-0 top-8 flex items-center justify-center px-4 text-center text-xs text-slate-400 bg-slate-50">
+                SHAP plot not available yet — run <code class="mx-1">scripts/explain_models.py</code>
+              </div>
+            </figure>
+          </div>
+        </div>
+      </div>
+
+      <div class="mt-4 pt-4 border-t border-slate-200 text-sm">
+        <h4 class="font-medium mb-1 text-slate-700">End-to-End Inference</h4>
+        <div id="inference-content" class="text-gray-600">Run inference to see results.</div>
+      </div>
+    </section>
+
+    <!-- Previous Runs -->
+    <section class="card">
+      <div class="flex flex-wrap justify-between items-center gap-3 mb-4">
+        <h2 class="text-sm font-semibold text-gray-500 uppercase">Previous Runs</h2>
+        <button id="btn-clear-runs" class="text-sm bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 px-3 py-1.5 rounded">
+          Clear All Runs
+        </button>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="min-w-full text-sm">
+          <thead>
+            <tr class="border-b text-left text-gray-500">
+              <th class="py-2 pr-4">Run ID</th>
+              <th class="py-2 pr-4">Started</th>
+              <th class="py-2 pr-4">Status</th>
+              <th class="py-2 pr-4">Duration</th>
+              <th class="py-2 pr-4">Stages</th>
+              <th class="py-2">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="runs-tbody">
+            <tr><td colspan="6" class="py-4 text-gray-400">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js?v=mass1"></script>
+</body>
+</html>
