@@ -1,490 +1,534 @@
-# AI-Enabled Space Situational Awareness
+# Space Junkies — RSO Characterization Pipeline
 
-**Explainable classification and multi-modal characterization of Resident Space Objects (RSOs)**
+**Space Junkies** ingests multi-source Resident Space Object (RSO) data, extracts rotation periods from MMT-9 photometry, then (Phase 3) classifies objects and estimates physical properties with small-N ML.
 
 | | |
 |---|---|
-| **Team** | Space Junkies |
-| **Phase** | 2 — Design & Proof of Concept |
+| **Phases** | 2 — Photometric PoC · 3 — Classification + mass regression + XAI |
 | **Repository** | [github.com/mars-colonizer/Space-Debris-Characterization](https://github.com/mars-colonizer/Space-Debris-Characterization) |
-| **Stack** | Python 3 · scikit-learn · LightGBM · SciPy · FastAPI · SQLite |
+| **Code map** | [graphify-out/graph.html](graphify-out/graph.html) · [GRAPH_REPORT.md](graphify-out/GRAPH_REPORT.md) |
+
+CLI and dashboard call the **same scripts**. The dashboard’s **Run Full SSA Pipeline** button runs Phase 2 then Phase 3 end-to-end.
 
 ---
 
-## What This Project Does
+## What / why / when (one screen)
 
-This is a **proof-of-concept pipeline** for Space Situational Awareness (SSA). It takes multi-modal observations about orbiting objects and predicts:
+| Question | Answer |
+|----------|--------|
+| **What** | A PoC SSA stack: live or synthetic ingest → period analysis → feature matrix → Stage 1 class (Payload / Rocket Body / Debris) → Stage 2 mass → demo inference panel |
+| **Why** | Photometry alone is weak for class/size; fusing orbital + photometric features under launch-group CV tests whether MMT-9 periods add signal without leaking DISCOS labels |
+| **When** | Phase 2 whenever you need light curves / periods / PoC plots. Phase 3 after Phase 2 artifacts exist (or via full SSA run). Re-run ML after changing the candidate set or period pipeline |
+| **How** | `scripts/*.py` orchestrate; `src/` holds clients, features, models; `dashboard/` subprocesses those scripts and parses logs into steppers + metric cards |
 
-1. **What kind of object it is** (rocket body, defunct satellite, fragment, etc.)
-2. **How big it is** (length, width, height in metres)
-3. **What shape it likely has** (Cylinder, Box-Wing, Flat-Plate, Irregular)
-4. **How it is rotating** (spin period in seconds; stable vs tumbling)
+---
 
-The pipeline deliberately separates **observational inputs** (TLE orbital history, light-curve statistics) from **ground-truth labels** (catalog dimensions, true shape, true spin) so that models are trained without data leakage.
+## Architecture (from Graphify)
+
+Graphify extracts a **code knowledge graph** (~767 nodes · ~1872 edges · 41 communities). Use it to answer “what calls what” without reading every file.
+
+**Core hubs (god nodes):** `MMT9Client`, `_write_actual_mmt_first()`, `init_database()`, `run_period_analysis()`, dashboard `server.py` / `PipelineRunner`, Phase 3 script `main()` entrypoints.
+
+**Community map (how the repo is clustered):**
+
+```mermaid
+flowchart TB
+  subgraph P2["Phase 2 — photometry"]
+    FD[fetch_data.py]
+    MMT[MMT9Client]
+    KT[keeptrack_client]
+    ST[spacetrack_client]
+    DIS[discos_client]
+    AP[analyze_periods.py]
+    PA[period_analysis.py]
+    DB[(rso_poc.db)]
+  end
+
+  subgraph P3["Phase 3 — ML"]
+    PREP[prepare_dataset.py]
+    LG[leakage_guard]
+    ABL[run_ablation.py]
+    XAI[explain_models.py]
+    S2[train_stage2.py]
+    INF[run_pipeline.py]
+  end
+
+  subgraph UI["Dashboard"]
+    SRV[server.py]
+    RUN[pipeline_runner.py]
+    LP[log_parser.py]
+    RL[result_loader.py]
+    JS[app.js]
+  end
+
+  FD --> MMT & KT & ST & DIS --> DB
+  DB --> AP --> PA --> DB
+  DB --> PREP --> LG --> ABL --> XAI --> S2 --> INF
+  SRV --> RUN --> FD & AP & PREP & ABL & XAI & S2 & INF
+  RUN --> LP --> JS
+  RL --> JS
+```
+
+Refresh the graph after code changes (no LLM / API cost):
+
+```bash
+graphify update .
+# optional: open interactive map
+open graphify-out/graph.html
+```
+
+Useful queries:
+
+```bash
+graphify explain "MMT9Client"
+graphify explain "apply_leakage_guard"
+graphify path "prepare_dataset.py" "run_pipeline.py" --undirected
+```
+
+---
+
+## End-to-end pipeline (when each stage runs)
 
 ```mermaid
 flowchart LR
-  subgraph ingest [Data Ingestion]
-    TLE[TLE / GP History]
-    DISCOS[DISCOS Metadata]
-    MMT[MMT-9 Light Curves]
+  subgraph phase2 [Phase 2]
+    A[1 fetch_data] --> B[2 analyze_periods]
   end
-
-  subgraph prep [Preparation]
-    MERGE[Merge on COSPAR ID]
-    FEAT[Orbital + Photometric Features]
-    LEAK[Leakage Guard]
-    SPLIT[Object-Level Split]
+  subgraph phase3 [Phase 3]
+    C[3 prepare_dataset] --> D[4 run_ablation]
+    D --> E[5 explain_models]
+    E --> F[6 train_stage2]
+    F --> G[7 run_pipeline inference]
   end
-
-  subgraph train [Training & Inference]
-    S1[Stage 1 Classifiers]
-    S2[Stage 2 Characterization]
-    INF[End-to-End Inference]
-  end
-
-  TLE --> MERGE
-  DISCOS --> MERGE
-  MMT --> FEAT
-  MERGE --> FEAT --> LEAK --> SPLIT
-  SPLIT --> S1 --> S2 --> INF
+  phase2 --> phase3
 ```
+
+| # | Script | What | Why | When |
+|---|--------|------|-----|------|
+| 1 | `scripts/fetch_data.py` | Pull/cache MMT-9, resolve NORAD→COSPAR, TLE, DISCOS → CSV + SQLite | Need a coherent object set before photometry/ML | First step of any live/synthetic ingest; dashboard **Ingestion** or full SSA |
+| 2 | `scripts/analyze_periods.py` | Quality filter → Lomb–Scargle → PDM → fold + PoC PNGs | Rotation period / tumbling are photometric features for Stage 1 | After fetch; dashboard **Photometric Processing** |
+| 3 | `scripts/prepare_dataset.py` | Merge TLE+DISCOS, orbital + photometric features, leakage guard, `phase3_feature_matrix.csv` | Build train-safe object-level matrix | After periods (needs photometry + catalog) |
+| 4 | `scripts/run_ablation.py` | GroupKFold ablation: orbital vs photometric vs **fused** LightGBM | Prove fusion helps; save `models/stage1/lgbm_fused.pkl` | After prepare |
+| 5 | `scripts/explain_models.py` | GroupKFold confusion matrix + optional SHAP | Explain fused model decisions | After ablation (`shap` optional) |
+| 6 | `scripts/train_stage2.py` | Per-class RF mass regressors (LOOCV, min 5 samples) | Condition mass on predicted class | After explain (needs matrix + classes) |
+| 7 | `scripts/run_pipeline.py` | Pick demo object → Stage 1 class → Stage 2 mass → print spin/tumbling | Dashboard **End-to-End Inference** panel | After Stage 2 models exist |
+
+**Dashboard steppers (UI only, Phase 2):** MMT-9 → KeepTrack → TLE+DISCOS → quality → LSP/PDM → central DB → evaluation artifacts. Phase 3 stages are separate buttons / full SSA chain; they do **not** remount the Phase 2 “database” stepper on soft warnings.
+
+**Before each new dashboard run:** derived outputs are cleared (models/processed/DB depending on stage set); **MMT-9 track cache is preserved**.
 
 ---
 
-## Dual Data Mode: SYNTHETIC vs ACTUAL
+## Phase 2 — Photometric proof of concept
 
-All ingestion flows through **`scripts/fetch_data.py`**, controlled by `DATA_MODE` in `.env` or the dashboard toggle.
+### What happens
 
-| Mode | When to use | What happens |
-|------|-------------|--------------|
-| **`SYNTHETIC`** | Offline demos, CI, no credentials | Generates ~80 physics-informed objects via `src/data/api_connectors.py` — TLE epochs, DISCOS metadata, catalog truths, and light-curve summaries. Fully self-contained. |
-| **`ACTUAL`** | Real experiments | Fetches live **Space-Track** TLEs and **ESA DISCOS** metadata, then pulls **MMT-9 / Mini-MegaTORTORA** light curves via API with offline CSV fallback. Requires credentials. |
+1. **Ingest** multi-source data into `data/raw/` and `data/database/rso_poc.db`
+2. **Process** each object’s light curve through quality → LSP → PDM → phase fold
+3. **Emit** periodograms, folded curves, summary CSVs, PoC plots
 
-```bash
-# .env
-DATA_MODE=SYNTHETIC    # or ACTUAL
-```
+### ACTUAL ingest order (`DATA_MODE=ACTUAL`)
 
-Both modes write the **same file layout** under `data/raw/`, so downstream scripts (`prepare_dataset.py`, training, inference) need **no code changes** when you switch modes.
+When `data/raw/mmt9_candidates.csv` exists:
 
-> **Legacy note:** `USE_SYNTHETIC=true/false` in `.env` still works as a fallback when `DATA_MODE` is unset. Prefer `DATA_MODE` going forward.
+1. **MMT-9** — download or load cached photometry per candidate NORAD  
+2. **KeepTrack** — NORAD → COSPAR (International Designator)  
+3. **Space-Track** — GP/TLE history **only** for KeepTrack-resolved MMT objects  
+4. **DISCOS** — metadata **only** for those same objects  
+5. Persist light curves, object index, TLE, DISCOS → CSV + SQLite  
+
+If KeepTrack is down: MMT curves still save; TLE/DISCOS are skipped.
+
+### MMT-9 light-curve handling
+
+- All tracks per object are **merged** (not longest-only)
+- Each track is **median-detrended** before concat (pass-to-pass offset)
+- Sorted by time; deduped on `(object_id, time)`
+- Names from MMT-9 catalog (`object_name` in DB)
+
+### Period analysis (`src/features/period_analysis.py`)
+
+| Step | How | Why |
+|------|-----|-----|
+| Quality filter | Drop non-finite / bad mags; need ≥10 points and ≥60 s span | Garbage in → false periods |
+| Lomb–Scargle | Astropy `LombScargle` + Baluev FAP on a span-aware frequency grid | Uneven sampling; FAP gates “periodic” |
+| PDM | Refine / validate around LSP peak (±15%) | Second opinion before folding |
+| Phase fold + plots | Fold at selected period; PNG: raw / periodogram / folded (mag inverted) | Human PoC artifacts |
+
+Tumbling: no stable significant period (FAP / consistency rules in the analyzer).
 
 ---
 
-## Quick Start
+## Phase 3 — Characterization ML
 
-### 1. Clone and install
+### Dataset preparation (`prepare_dataset.py`)
+
+**What:** Builds `data/processed/phase3_feature_matrix.csv` — one row per object.
+
+**How:**
+
+1. Load / clean TLE + DISCOS; merge on normalized COSPAR  
+2. Engineer **orbital** features (`compute_orbital_features`)  
+3. Aggregate **photometric** features from period analysis / tracks (`PHOTOMETRIC_FEATURE_COLS`)  
+4. Collapse DISCOS subclasses → `Payload` | `Rocket Body` | `Debris`  
+5. Add `launch_group` for GroupKFold (same launch must not leak train→test)  
+6. **`apply_leakage_guard`** — strip ground-truth size/mass/class columns from `X`; keep photometric observables  
+
+**Why leakage guard matters:** DISCOS `mass` / `length` / `object_class` are labels or near-labels. Training on them would fake perfect accuracy. Photometric columns like `median_period_sec` are allowed — they are measurements, not catalog answers.
+
+### Stage 1 ablation (`run_ablation.py`)
+
+| Feature set | Contents | Purpose |
+|-------------|----------|---------|
+| Orbital | inclination, eccentricity, SMA, rates, epoch span, … | Baseline without photometry |
+| Photometric | track_count, periodic_fraction, median_period_sec, period_scatter, median_amplitude, is_tumbling_consistent | Photometry-only |
+| **Fused** | orbital ∪ photometric | Target model for ops |
+
+- CV: **GroupKFold** on `launch_group` (default 4 splits)  
+- Models: LightGBM (+ AdaBoost/tree baselines in the script)  
+- Artifact: `models/stage1/lgbm_fused.pkl` (model + label encoder + feature names + fill value)
+
+### Explainability (`explain_models.py`)
+
+- Out-of-fold confusion matrix for the fused LightGBM  
+- SHAP feature importance if `shap` is installed (optional — CM still runs without it)  
+- Writes under `results/phase3/` (dashboard Phase 3 image gallery)
+
+### Stage 2 regression (`train_stage2.py`)
+
+- **What:** Prefer continuous target `mass` (else `true_mass`, …)  
+- **How:** One `RandomForestRegressor` per class with ≥5 labeled samples; **LOOCV** metrics (small-N honest)  
+- **Why class-conditioned:** Mass distributions differ sharply by class; a single global regressor mixes regimes  
+- **Artifacts:** `models/stage2/regressor_payload.pkl`, `regressor_rocket_body.pkl` (Debris often skipped — too few mass labels)
+
+### End-to-end inference (`run_pipeline.py`)
+
+1. Load fused Stage 1 model + feature matrix  
+2. Prefer a **Payload / Rocket Body** sample that has a trained mass regressor (dashboard-friendly demo)  
+3. Predict class + confidence  
+4. Run matching Stage 2 regressor → **Estimated mass**  
+5. Print **spin period** / **tumbling** from photometric columns (not Stage 2)  
+6. Dashboard parses stdout (`Mass: … kg`, `Spin period: … s`, …) into the inference card  
+
+There is no L×W×H model in the default Phase 3 path; the UI shows mass when dimensions are absent.
+
+---
+
+## Data modes
+
+| Mode | Credentials | Behaviour |
+|------|-------------|-----------|
+| **`SYNTHETIC`** | None | Physics-informed offline objects (TLE-like, DISCOS-like, synthetic curves) |
+| **`ACTUAL`** | Space-Track, DISCOS, KeepTrack (recommended) | Live ingest for NORADs in `mmt9_candidates.csv` |
+
+Set in `.env` (`DATA_MODE=…`) or toggle in the dashboard before a run. Mode is copied into the subprocess environment when the dashboard starts a pipeline.
+
+---
+
+## Technology
+
+| Layer | Stack |
+|-------|--------|
+| Pipeline | Python 3 · pandas · NumPy · SciPy · Astropy · matplotlib · LightGBM · scikit-learn |
+| Storage | CSV under `data/` + SQLite (`data/database/rso_poc.db`) |
+| Dashboard | FastAPI · uvicorn · vanilla HTML/JS · Tailwind (CDN) · WebSocket logs |
+| Graph | `graphify` CLI → `graphify-out/` (code knowledge graph) |
+| External | [MMT-9](http://mmt.favor2.info) · [KeepTrack](https://api.keeptrack.space/v4/docs) · [Space-Track](https://www.space-track.org/) · [ESA DISCOS](https://discosweb.esoc.esa.int/) |
+
+No Streamlit, React, or Node build step.
+
+---
+
+## Quick start
+
+### 1. Install
 
 ```bash
-git clone git@github.com:mars-colonizer/Space-Debris-Characterization.git
-cd Space-Debris-Characterization
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+cd "/path/to/V2"
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 ```
 
-### 2. Ingest data
+### 2. Configure `.env`
 
-**Synthetic (recommended first run — no API keys):**
+**Offline:**
 
-```bash
-# .env: DATA_MODE=SYNTHETIC
-python scripts/fetch_data.py
+```env
+DATA_MODE=SYNTHETIC
 ```
 
-**Live APIs:**
+**Live:**
 
-```bash
-# .env: DATA_MODE=ACTUAL
-# Set SPACE_TRACK_USERNAME, SPACE_TRACK_PASSWORD, DISCOS_TOKEN
-python scripts/fetch_data.py
+```env
+DATA_MODE=ACTUAL
+SPACE_TRACK_USERNAME=your@email.com
+SPACE_TRACK_PASSWORD=your_password
+DISCOS_TOKEN=your_discos_token
+KEEPTRACK_API_KEY=your_keeptrack_api_key
+MMT9_CANDIDATES_CSV=data/raw/mmt9_candidates.csv
+FETCH_EPOCH_DAYS=60
 ```
 
-For MMT light curves in ACTUAL mode, either configure `MMT_API_URL` or place offline CSV files in `data/raw/mmt_lightcurves/` (see [Offline MMT files](#offline-mmt-light-curve-files) below).
+Never commit `.env`. KeepTrack data is [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/).
 
-> **Security:** Never commit `.env`. Rotate credentials if exposed.
-
-`scripts/generate_sample_data.py` is a thin wrapper that still works, but **`fetch_data.py` is the canonical ingestion entry point**.
-
-### 3. Train and infer (CLI)
+### 3. CLI — Phase 2 only
 
 ```bash
-python scripts/prepare_dataset.py   # merge, features, leakage filter, train/test split
-python scripts/train_stage1.py      # Decision Tree, LightGBM, AdaBoost
-python scripts/train_stage2.py      # size, shape, rotation models (per class)
-python scripts/run_pipeline.py      # end-to-end inference on one test object
+export PYTHONPATH=.
+python3 scripts/fetch_data.py
+python3 scripts/analyze_periods.py
 ```
 
-### 4. Control dashboard (optional)
+Tips:
+
+- First ACTUAL MMT download: ~1–2 min/object (50 candidates ≈ 30–60+ min)  
+- Cache hits skip re-download  
+- Subset: `MMT9_CANDIDATES_LIMIT=5 python3 scripts/fetch_data.py`  
+- Force refresh: `MMT9_FORCE_REFRESH=1 python3 scripts/fetch_data.py`
+
+### 4. CLI — Phase 3
 
 ```bash
-uvicorn dashboard.server:app --host 127.0.0.1 --port 8000 --reload
+export PYTHONPATH=.
+python3 scripts/prepare_dataset.py
+python3 scripts/run_ablation.py
+python3 scripts/explain_models.py      # pip install shap  # optional
+python3 scripts/train_stage2.py
+python3 scripts/run_pipeline.py        # end-to-end demo object
 ```
 
-Open [http://127.0.0.1:8000](http://127.0.0.1:8000)
+### 5. Dashboard
 
-Use the **header mode switch** (🧪 Synthetic / 📡 Live) to pick the data source, then click **Run Full Pipeline**. The dashboard runs the same `scripts/` — no duplicated ML logic.
+```bash
+source .venv/bin/activate
+PYTHONPATH=. python3 -m uvicorn dashboard.server:app --host 127.0.0.1 --port 8555 --reload
+```
+
+Open [http://127.0.0.1:8555](http://127.0.0.1:8555).
+
+| Control | Runs |
+|---------|------|
+| **Run Full SSA Pipeline** | fetch → periods → prepare → ablation → explain → stage2 → inference |
+| Ingestion / Photometric Processing | Phase 2 pieces |
+| Prepare / Stage 1 / XAI / Stage 2 / Inference | Phase 3 pieces |
+| Stop | Kill subprocess |
+| Reset / Clear All Data | Purge derived artifacts (see API) |
+
+Pipeline Python: process interpreter, or **`RSO_PYTHON`** if set (TrueNAS).
 
 ---
 
-## Control Dashboard
+## TrueNAS / network share
 
-FastAPI backend + single-page HTML/JS frontend (TailwindCSS via CDN, no Node build step).
+Do **not** create `.venv` on the SMB/NFS project folder — execute bits are blocked.
 
-### UI features
+```bash
+mkdir -p /dev/shm/venvs
+python3 -m venv /dev/shm/venvs/rso-v2 --without-pip
+curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
+/dev/shm/venvs/rso-v2/bin/python3 /tmp/get-pip.py
+/dev/shm/venvs/rso-v2/bin/python3 -m pip install -r "/mnt/SC/Sanu/Study Project/V2/requirements.txt"
 
-| Feature | Description |
-|---------|-------------|
-| **Mode switch** | Toggle `SYNTHETIC` ↔ `ACTUAL` before ingestion; logged to the live terminal |
-| **Pipeline control** | Full pipeline or individual stages (Ingestion → Prepare → Stage 1 → Stage 2 → Inference) |
-| **Live terminal** | WebSocket log stream with `[INFO]` / `[OK]` / `[WARNING]` / `[ERROR]`; API tokens redacted |
-| **10-step stepper** | Real-time status per pipeline phase |
-| **Metric cards** | Ingestion, photometry, data quality, leakage, Stage 1/2, inference (shape + spin) |
-| **Run history** | `results/pipeline_runs/<timestamp>/` with per-run and bulk delete |
-| **Reset** | Purge processed data, models, and metrics (`POST /api/reset-all`) |
+export RSO_PYTHON=/dev/shm/venvs/rso-v2/bin/python3
+cd "/mnt/SC/Sanu/Study Project/V2"
+PYTHONPATH=. $RSO_PYTHON -m uvicorn dashboard.server:app --host 127.0.0.1 --port 8555
+```
 
-### API reference
+SSH tunnel from your Mac:
+
+```bash
+ssh -L 8555:127.0.0.1:8555 truenas_admin@10.10.10.101
+```
+
+Then open **http://127.0.0.1:8555**. `/dev/shm/venvs` clears on reboot. Prefer `python3 -m pip` / `python3 -m uvicorn` over bare `bin/pip` scripts.
+
+---
+
+## MMT candidate list
+
+**File:** `data/raw/mmt9_candidates.csv` — must include a NORAD column (`norad_id`, `norad`, `satno`, or `object_id`):
+
+```csv
+candidate_number,norad_id,name
+1,28897,NCUBE-2
+2,43656,CZ-4B R/B
+```
+
+### MMT cache layout
+
+| Path | Purpose |
+|------|---------|
+| `data/raw/mmt_lightcurves/mmt_lightcurves.csv` | Combined light curves |
+| `data/raw/mmt_lightcurves/mmt9_tracks/{norad}_{track_id}.txt` | Per-track raw cache |
+| `data/raw/mmt_lightcurves/mmt9_catalog.txt` | Catalog (~7 day TTL) |
+
+---
+
+## Dashboard internals (how the UI stays honest)
+
+```mermaid
+sequenceDiagram
+  participant UI as app.js
+  participant API as server.py
+  participant Run as PipelineRunner
+  participant Scr as scripts/*.py
+  participant St as state + log_parser
+
+  UI->>API: POST /api/run-pipeline
+  API->>API: clear_derived (keep MMT-9)
+  API->>Run: start subprocess chain
+  Note over API,Run: runner.start() before poller<br/>avoids false STOPPED
+  loop each stage
+    Run->>Scr: python script
+    Scr-->>Run: stdout lines
+    Run->>St: on_log / parse steppers
+    St-->>UI: WS logs + status
+  end
+  Run->>St: inference_log → parse_inference_from_log
+  UI->>API: GET /api/metrics
+  API-->>UI: cards + inference panel
+```
+
+| Module | Role |
+|--------|------|
+| `dashboard/stages.py` | Exec stage keys, scripts, Phase 2 vs 3, `FULL_PIPELINE_KEYS` |
+| `dashboard/pipeline_runner.py` | Subprocess chain, log broadcast, `inference_log` capture |
+| `dashboard/log_parser.py` | Map log lines → stepper COMPLETE/WARNING/FAILED; sanitize secrets |
+| `dashboard/result_loader.py` | Metrics from DB/CSV/artifacts; parse inference stdout |
+| `dashboard/state.py` | Run lifecycle + `inference_result` |
+| `dashboard/static/app.js` | Steppers, Phase 3 cards, inference (mass / spin / tumbling) |
+
+### Selected API
 
 | Method | Endpoint | Purpose |
 |--------|----------|---------|
-| `GET` | `/` | Dashboard UI |
-| `GET` | `/api/current-mode` | Active `SYNTHETIC` or `ACTUAL` |
-| `POST` | `/api/set-mode` | Set mode: `{"mode": "SYNTHETIC" \| "ACTUAL"}` |
-| `GET` | `/api/status` | Pipeline state, stepper, timers |
-| `GET` | `/api/metrics` | Metric cards from disk artifacts |
-| `GET` | `/api/previous-runs` | Run history |
-| `POST` | `/api/run-pipeline` | Full sequential pipeline (uses active mode for fetch) |
-| `POST` | `/api/run-stage/{name}` | Single stage: `fetch`, `prepare`, `stage1`, `stage2`, `inference` |
-| `POST` | `/api/stop-pipeline` | Terminate active subprocess |
-| `POST` | `/api/reset-all` | Clear data/models/metrics (blocked while RUNNING) |
-| `DELETE` | `/api/runs/{run_id}` | Delete one historical run |
-| `DELETE` | `/api/runs` | Clear all run history |
-| `WS` | `/ws/logs` | Live log + status stream |
-
-Mode cannot be changed while a pipeline run is active.
+| `GET` | `/` | UI |
+| `GET/POST` | `/api/current-mode`, `/api/set-mode` | SYNTHETIC / ACTUAL |
+| `GET` | `/api/metrics` | Metric cards + inference |
+| `POST` | `/api/run-pipeline` | Full SSA (Phase 2+3) |
+| `POST` | `/api/run-stage/{name}` | One exec stage |
+| `POST` | `/api/stop-pipeline` | Stop |
+| `POST` | `/api/reset-all` | Purge artifacts |
+| `WS` | `/ws/logs` | Live logs + status |
 
 ---
 
-## Project Structure
+## Project layout
 
 ```
-Space-Debris-Characterization/
-├── dashboard/                    # FastAPI control center
-│   ├── server.py                 # REST + WebSocket routes
-│   ├── pipeline_runner.py        # Subprocess orchestration + log broadcast
-│   ├── state.py                  # Thread-safe pipeline state
-│   ├── stages.py                 # UI steps ↔ script mappings
-│   ├── log_parser.py             # Step status + credential masking
-│   ├── result_loader.py          # Metric card data from disk
-│   ├── templates/index.html
-│   └── static/                   # app.js, terminal.css
-│
+├── dashboard/              # FastAPI UI, runner, parsers, result_loader
 ├── data/
-│   ├── raw/                      # Regenerable source CSVs (gitignored)
-│   │   ├── tle_history.csv
-│   │   ├── discos_metadata.csv
-│   │   ├── photometric_observations.csv
-│   │   ├── rso_catalog.csv
-│   │   └── mmt_lightcurves/      # Offline MMT CSV/JSON fallback
-│   ├── processed/                # train.csv, test.csv, dataset_meta.json
-│   └── database/                 # SQLite (rso_poc.db)
-│
-├── models/                       # Saved joblib models (gitignored)
-├── results/                      # Metrics, confusion matrices, run logs
-│
-├── scripts/                      # CLI entry points (orchestration only)
-│   ├── fetch_data.py             # ★ Unified ingestion (SYNTHETIC or ACTUAL)
-│   ├── generate_sample_data.py   # Legacy wrapper → synthetic generator
-│   ├── prepare_dataset.py
-│   ├── train_stage1.py
-│   ├── train_stage2.py
-│   └── run_pipeline.py
-│
-└── src/
-    ├── config.py                 # Paths, seeds, leakage rules, column names
-    ├── data/
-    │   ├── data_mode.py          # Runtime SYNTHETIC/ACTUAL resolution
-    │   ├── api_connectors.py     # Synthetic multi-modal catalog generator
-    │   ├── mmt_client.py         # MMT-9 client + photometric feature extraction
-    │   ├── db_manager.py         # SQLite: rso_catalog, photometric_observations
-    │   ├── leakage_guard.py      # Blocks ground truth from feature matrix X
-    │   ├── spacetrack_client.py
-    │   ├── discos_client.py
-    │   ├── merge_data.py, clean_data.py, ingest.py, storage.py
-    ├── features/orbital_features.py
-    ├── models/                   # Stage 1/2 + sequential RSOPipeline
-    └── evaluation/               # Metrics helpers
+│   ├── raw/                # TLE, DISCOS, MMT cache, candidates CSV
+│   ├── processed/          # photometric CSVs, phase3_feature_matrix.csv
+│   └── database/           # rso_poc.db
+├── models/
+│   ├── stage1/             # lgbm_fused.pkl
+│   └── stage2/             # regressor_{class}.pkl
+├── results/
+│   ├── periodograms/       # norad_*.json
+│   ├── folded_lightcurves/
+│   ├── poc_plots/          # norad_*.png
+│   ├── phase3/             # confusion matrix, SHAP
+│   └── pipeline_runs/      # dashboard run logs
+├── scripts/                # CLI entrypoints (see table above)
+├── src/
+│   ├── config.py           # paths, columns, leakage lists
+│   ├── data/               # API clients, SQLite, merge, leakage_guard
+│   ├── features/           # quality, period_analysis, orbital, photometric
+│   ├── models/             # stage1/stage2 helpers, RSOPipeline (legacy path)
+│   └── utils/terminal.py   # shared CLI logging (dashboard parses these lines)
+├── graphify-out/           # code knowledge graph + report
+└── tests/
 ```
 
-**Design rule:** ML logic lives in `src/` and `scripts/`. The dashboard only **orchestrates** existing scripts as subprocesses.
+---
+
+## Database tables
+
+| Table | Contents |
+|-------|----------|
+| `objects` | `object_id` (NORAD), `cospar_id`, `object_name` |
+| `light_curves` | `time`, `mag`, `mag_err` |
+| `photometric_observations` | Per-object period / quality summary |
+| `periodograms` | LSP/PDM + JSON paths |
+| `folded_light_curves` | Phase-folded samples |
+| `rso_catalog` | Ground-truth labels (SYNTHETIC) |
 
 ---
 
-## Data Sources & Files
-
-| Source | Raw file | Role |
-|--------|----------|------|
-| Space-Track GP/TLE | `data/raw/tle_history.csv` | Orbital element time series per object |
-| ESA DISCOS | `data/raw/discos_metadata.csv` | Object class, physical metadata |
-| MMT / photometry | `data/raw/photometric_observations.csv` | Per-object light-curve **summary features** |
-| Ground-truth catalog | `data/raw/rso_catalog.csv` | True dimensions, shape, spin (training labels only) |
-
-Everything merges on **COSPAR ID** (`YYYY-NNN[A-Z]`), normalized in `src/data/clean_data.py`. A merge audit is written to `data/processed/merge_summary.txt`.
-
----
-
-## MMT-9 Light-Curve Processing
-
-Implemented in `src/data/mmt_client.py`.
-
-### What the client does
-
-1. **Live API** — attempts `MMT_API_URL` (configurable in `.env`) for `(timestamps, magnitudes, errors)` given a COSPAR or NORAD ID.
-2. **Offline fallback** — if the API times out or fails, reads CSV/JSON from `data/raw/mmt_lightcurves/`.
-3. **Feature extraction** — `extract_photometric_features()` compresses each light curve into the six summary columns used by the ML pipeline.
-
-### Extracted features (model inputs — allowed in X)
-
-| Column | How it is computed |
-|--------|-------------------|
-| `mag_mean` | Mean apparent magnitude |
-| `mag_std` | Standard deviation of magnitudes |
-| `delta_mag` | 95th − 5th percentile (peak-to-peak amplitude) |
-| `estimated_period_sec` | Dominant period from **Lomb–Scargle** periodogram (clamped 1–3600 s) |
-| `apparent_shape_score` | Skewness of the magnitude distribution |
-| `is_tumbling` | `1` if no dominant rotation period is detected; `0` if a stable periodic signal dominates |
-
-### Offline MMT light-curve files
-
-Place files in `data/raw/mmt_lightcurves/` when the live API is unavailable:
-
-**Per-object CSV** (`{norad_id}_{cospar}.csv`):
-
-```csv
-timestamp,magnitude,error
-2024-01-01T00:00:00Z,10.20,0.05
-2024-01-01T00:00:15Z,10.85,0.05
-```
-
-**Combined CSV** (`mmt_lightcurves.csv`):
-
-```csv
-cospar_id,object_id,timestamp,magnitude,error
-1998-067A,OBJ-0042,2024-01-01T00:00:00Z,10.2,0.05
-```
-
-See `data/raw/mmt_lightcurves/README.md` for full format notes.
-
----
-
-## Synthetic Light-Curve Profiles
-
-When `DATA_MODE=SYNTHETIC`, `src/data/api_connectors.py` generates class-conditioned light curves:
-
-| Object class | True shape | Spin period | Δm | Tumbling |
-|--------------|------------|-------------|-----|----------|
-| Rocket Body | Cylinder | 5–30 s | 1.5–3.0 | Mostly stable |
-| Defunct Satellite / MRO | Box-Wing | 60–600 s | 0.2–0.8 | Stabilized (`0`) |
-| Fragment | Irregular / Flat-Plate | 0.5–8 s | > 2.0 | Chaotic (`1`) |
-
-Catalog truths and photometric summaries are also persisted to SQLite (`src/data/db_manager.py`).
-
----
-
-## Leakage Prevention
-
-Physical properties must **not** appear in the feature matrix during training — otherwise models would cheat by reading the answer.
-
-`src/data/leakage_guard.py` removes ground-truth columns before training:
-
-| Blocked from X (labels) | Allowed in X (observations) |
-|-------------------------|----------------------------|
-| `true_length`, `true_width`, `true_height` | `mag_mean`, `mag_std`, `delta_mag` |
-| `true_mass`, `true_shape`, `true_period` | `estimated_period_sec`, `apparent_shape_score` |
-| `true_tumbling`, `object_class` | `is_tumbling` (observational estimate) |
-| Legacy: `length`, `width`, `height`, `mass`, `shape` | Orbital features (inclination, SMA, drift, …) |
-
-The dashboard **Leakage Protection** card lists removed columns and verifies zero COSPAR overlap between train and test splits.
-
----
-
-## Feature Engineering & Split
-
-**Orbital** (`src/features/orbital_features.py`) — aggregated to one row per object:
-
-- Keplerian snapshot: inclination, eccentricity, semi-major axis, RAAN, arg perigee, mean anomaly
-- Derived: `orbital_period_days`, inclination drift, SMA decay, epoch count/span
-
-**Photometric** — merged at prepare time from `photometric_observations.csv`.
-
-**Preprocessing:** `SimpleImputer` + `OneHotEncoder` inside sklearn `Pipeline`; fitted on **training data only**.
-
-**Split:** Object-level holdout by COSPAR ID (`TEST_SIZE=0.2`, `RANDOM_SEED=42`). All epochs for one object stay in the same fold — prevents epoch leakage.
-
----
-
-## Models & Outputs
-
-### Stage 1 — Classification
-
-| Model | Saved artifact |
-|-------|----------------|
-| Decision Tree | `models/stage1_decision_tree.joblib` |
-| LightGBM | `models/stage1_lightgbm.joblib` *(default at inference)* |
-| AdaBoost | `models/stage1_adaboost.joblib` |
-
-**Classes:** Rocket Body, Defunct Satellite, Mission-Related Object, Fragment.
-
-Metrics → `results/stage1_metrics.csv` + confusion matrix PNGs.
-
-### Stage 2 — Class-conditioned characterization
-
-One model set **per object class** (skipped if fewer than 5 training samples):
-
-| Model type | Predicts | Artifact |
-|------------|----------|----------|
-| Size regressor | `true_length`, `true_width`, `true_height` | `models/stage2/{class}.joblib` |
-| Shape classifier | `true_shape` (4 geometric classes) | `models/stage2_shape_models.joblib` |
-| Rotation | `true_period`, tumbling state | `models/stage2_rotation_models.joblib` |
-
-Metrics → `results/stage2_metrics.csv`.
-
-### End-to-end inference example
-
-```
-Predicted class: Rocket Body
-Confidence: 100.00%
-Length: 9.80 m  ·  Width: 3.40 m  ·  Height: 2.75 m
-Shape: Cylinder
-Spin period: 13.75 s  ·  Tumbling: Stable
-Latency: 0.024 s
-```
-
-Stage 1 routes to the correct Stage 2 model bundle. If Stage 1 misclassifies, Stage 2 uses the wrong class model — a realistic operational error mode.
-
----
-
-## Configuration Reference
-
-### Environment variables (`.env`)
+## Configuration reference
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DATA_MODE` | `SYNTHETIC` | `SYNTHETIC` or `ACTUAL` — primary mode switch |
-| `USE_SYNTHETIC` | `true` | Legacy fallback when `DATA_MODE` unset |
-| `SPACE_TRACK_USERNAME` | — | Space-Track login (ACTUAL mode) |
-| `SPACE_TRACK_PASSWORD` | — | Space-Track password (ACTUAL mode) |
-| `DISCOS_TOKEN` | — | ESA DISCOSweb bearer token (ACTUAL mode) |
-| `MMT_API_URL` | built-in default | MMT light-curve API endpoint (optional) |
-| `FETCH_MAX_OBJECTS` | `200` | DISCOS fetch limit (ACTUAL mode) |
-| `FETCH_EPOCH_DAYS` | `60` | TLE history window in days (ACTUAL mode) |
+| `DATA_MODE` | `SYNTHETIC` | `SYNTHETIC` or `ACTUAL` |
+| `RSO_PYTHON` | — | Dashboard subprocess interpreter (TrueNAS) |
+| `MMT9_CANDIDATES_CSV` | `data/raw/mmt9_candidates.csv` | ACTUAL NORAD list |
+| `MMT9_CANDIDATES_LIMIT` | `0` | Subset cap (`0` = all) |
+| `MMT9_FORCE_REFRESH` | `false` | Ignore MMT cache |
+| `FETCH_EPOCH_DAYS` | `60` | Space-Track GP lookback |
+| `FETCH_MAX_OBJECTS` | `50` | Catalog fallback if CSV missing |
+| `KEEPTRACK_API_KEY` | — | NORAD ↔ COSPAR |
 
-### Python constants (`src/config.py`)
-
-| Constant | Default | Purpose |
-|----------|---------|---------|
-| `RANDOM_SEED` | `42` | Reproducibility |
-| `TEST_SIZE` | `0.2` | Holdout fraction |
-| `MIN_STAGE2_SAMPLES_PER_CLASS` | `5` | Minimum samples to train Stage 2 |
-| `PHOTOMETRIC_FEATURE_COLS` | 6 columns | Allowed light-curve inputs |
-| `LEAKAGE_TARGET_COLUMNS` | 7 `true_*` cols | Explicit ground-truth blocklist |
+See `.env.example` for the full list.
 
 ---
 
-## Typical Workflows
+## Troubleshooting
 
-### Offline demo (no credentials)
-
-```bash
-DATA_MODE=SYNTHETIC python scripts/fetch_data.py
-python scripts/prepare_dataset.py
-python scripts/train_stage1.py
-python scripts/train_stage2.py
-python scripts/run_pipeline.py
-```
-
-### Live experiment
-
-```bash
-# .env: DATA_MODE=ACTUAL + credentials
-python scripts/fetch_data.py          # Space-Track + DISCOS + MMT
-python scripts/prepare_dataset.py
-python scripts/train_stage1.py
-python scripts/train_stage2.py
-python scripts/run_pipeline.py
-```
-
-### Dashboard-driven full run
-
-```bash
-uvicorn dashboard.server:app --host 127.0.0.1 --port 8000 --reload
-# 1. Select mode in header
-# 2. Click "Run Full Phase 2 Pipeline"
-# 3. Watch live terminal + metric cards update
-```
-
-### Reset and start fresh
-
-Use the dashboard **Reset / Clear All Data** button, or:
-
-```bash
-# Purges data/raw CSVs, processed sets, models, results metrics
-# (via dashboard API POST /api/reset-all — or delete directories manually)
-```
+| Problem | Fix |
+|---------|-----|
+| `No module named 'pandas'` from dashboard | Set `RSO_PYTHON` to the venv with `requirements.txt` |
+| `failed to map segment from shared object` | Venv off the network share → `/dev/shm/venvs/...` |
+| Browser can't reach NAS `:8555` | Bind localhost + SSH tunnel, or `--host 0.0.0.0` |
+| Scripts can't import `src` | `PYTHONPATH=.` from project root |
+| Empty MMT objects | NORAD missing from MMT catalog — check ingest warnings |
+| No TLE/DISCOS for some objects | Expected without KeepTrack COSPAR |
+| Inference shows empty mass / spin | Re-run **Inference** after Stage 2; hard-refresh UI. Debris often has no mass regressor — panel shows n/a + spin from photometry |
+| SHAP missing | Optional: `pip install shap`; confusion matrix still works |
+| False STOPPED right after Start | Fixed by starting runner before poller — update `dashboard/server.py` if on an old checkout |
+| Graphify stale | `graphify update .` then open `graphify-out/graph.html` |
 
 ---
 
-## Git Workflow
+## Limitations
 
-Remote (SSH recommended):
+- Fixed candidate set; not every NORAD has MMT tracks or KeepTrack COSPAR  
+- KeepTrack individual lookup capped (~25/run) — some COSPARs may be missing  
+- SQLite + CSV — PoC scale, not production ops  
+- Stage 2 mass needs ≥5 labeled samples/class — Debris often skipped  
+- Small-N GroupKFold/LOOCV: metrics are indicative, not flight certification  
+
+---
+
+## Exploring the code with Graphify
+
+This repo is mapped with **graphify** so architecture stays queryable as scripts grow.
+
+| Artifact | Use |
+|----------|-----|
+| [`graphify-out/graph.html`](graphify-out/graph.html) | Interactive community graph |
+| [`graphify-out/GRAPH_REPORT.md`](graphify-out/GRAPH_REPORT.md) | Hubs, communities, surprising edges, suggested questions |
+| [`graphify-out/graph.json`](graphify-out/graph.json) | Machine-readable graph |
 
 ```bash
-git remote -v
-# origin  git@github.com:mars-colonizer/Space-Debris-Characterization.git
-
-git add -A
-git status
-git commit -m "Describe your change"
-git push origin main
+graphify update .                 # re-extract after edits
+graphify explain "fetch_data.py"  # neighbors of a hub
+graphify explain "PipelineRunner" # or path::symbol if ambiguous
+graphify path "MMT9Client" "apply_leakage_guard" --undirected
 ```
 
----
+**Suggested questions the graph is good at answering** (from the report):
 
-## Limitations (POC Scope)
-
-| Topic | Notes |
-|-------|-------|
-| Synthetic scores | Near-perfect Stage 1 on synthetic data is expected — orbital priors are class-separable by design |
-| Stage 2 R² | May be negative on small holdouts without hyperparameter tuning |
-| Shape/tumbling models | May fall back to constant predictions when a class has only one label in training |
-| MMT API | Live endpoint is best-effort; offline CSV fallback is the primary ACTUAL-mode path until a production API URL is configured |
-| SQLite storage | Partial — tables populated on ingest/prepare, not a full operational database |
-| Explainability | SHAP / XAI deferred to Phase 3 |
-
-| Capability | Status |
-|------------|--------|
-| Dual mode SYNTHETIC / ACTUAL | ✅ |
-| Space-Track + DISCOS ingestion | ✅ |
-| MMT light-curve features | ✅ |
-| Multi-output Stage 2 (size + shape + rotation) | ✅ |
-| FastAPI dashboard + mode toggle | ✅ |
-| SHAP / hyperparameter tuning | Phase 3 |
+- Why does `MMT9Client` bridge fetch, legacy `MMTClient`, and `_write_actual_mmt_first`?  
+- What does `apply_leakage_guard` remove vs allow before Stage 1?  
+- How do dashboard `ExecStage` / `StepDef` relate to log-parser stepper keys?
 
 ---
 
-## Phase 3 Boundary (Not Implemented)
+## License & attribution
 
-- SHAP explainability and ablation studies
-- Deep learning benchmarks
-- Production deployment and latency SLA hardening
-- Full operational DISCOS + MMT streaming ingestion
+Academic / competition PoC.
 
----
-
-## License & Attribution
-
-Phase 2 proof-of-concept for academic / competition use.
-
-**Data sources:** [Space-Track](https://www.space-track.org/) · [ESA DISCOS](https://discosweb.esoc.esa.int/) · MMT-9 / Mini-MegaTORTORA (light-curve photometry)
+**Data sources:** [Space-Track](https://www.space-track.org/) · [ESA DISCOS](https://discosweb.esoc.esa.int/) · [MMT-9 / Mini-MegaTORTORA](http://mmt9.ru/satellites/) ([mmt.favor2.info](http://mmt.favor2.info)) · [KeepTrack](https://keeptrack.space/)

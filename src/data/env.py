@@ -38,11 +38,15 @@ def env_present(name: str) -> bool:
     return bool(os.getenv(name, "").strip())
 
 
+class MissingConfigError(Exception):
+    """Raised when a required .env variable is absent."""
+
+
 def require_env(name: str) -> str:
     load_project_env()
     val = os.getenv(name)
     if not val:
-        raise EnvironmentError(
+        raise MissingConfigError(
             f"Missing {name}. Copy .env.example to .env and set credentials."
         )
     return val

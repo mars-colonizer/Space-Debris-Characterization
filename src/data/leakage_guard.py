@@ -32,8 +32,8 @@ def apply_leakage_guard(
 
     Blocked: true_length, true_width, true_height, true_mass, true_shape, true_period,
     true_tumbling (+ legacy length/width/height/mass/shape via config).
-    Allowed in X: mag_mean, mag_std, delta_mag, estimated_period_sec,
-    apparent_shape_score, is_tumbling (observational estimate).
+    Allowed in X: track_count, periodic_fraction, median_period_sec, period_scatter,
+    median_amplitude, is_tumbling_consistent (object-level LSP aggregates).
     """
     # ponytail: explicit allowlist prevents shape/period regex false positives on photometry cols
     _ = PHOTOMETRIC_FEATURE_COLS  # documented contract; filter uses extra_leakage only

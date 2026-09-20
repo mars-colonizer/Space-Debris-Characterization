@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any, Callable
 
 import pandas as pd
 import requests
 
-from src.config import COSPAR_ID_COL, EPOCH_COL, OBJECT_ID_COL, ORBITAL_ELEMENT_COLS
+from src.config import COSPAR_ID_COL, EPOCH_COL, OBJECT_ID_COL
+from src.data.clean_data import normalize_cospar_id
 from src.data.env import require_env
 
 logger = logging.getLogger(__name__)
@@ -39,12 +39,8 @@ def _mean_motion_to_sma(mean_motion_rev_per_day: float) -> float:
 
 
 def _normalize_cospar(object_id: str) -> str:
-    s = str(object_id).strip().upper()
-    m = re.match(r"^(\d{4})[- ]?(\d{1,3})([A-Z]{1,3})?$", s)
-    if m:
-        piece = (m.group(3) or "A")[0]
-        return f"{m.group(1)}-{int(m.group(2)):03d}{piece}"
-    return s
+    """Same YYYY-NNNX form as KeepTrack (shared normalize_cospar_id)."""
+    return str(normalize_cospar_id(pd.Series([object_id])).iloc[0] or str(object_id).strip().upper())
 
 
 def _records_to_dataframe(
@@ -92,31 +88,46 @@ def fetch_gp_history(
     progress_callback: Callable[[int], None] | None = None,
 ) -> pd.DataFrame:
     """
-    Fetch GP history for NORAD catalog IDs (single batched query).
+    Fetch GP history for NORAD catalog IDs (paginated when a page hits ``limit``).
 
-    ponytail: one gp_history call for the whole ID list; upgrade path is per-object cache on disk.
+    Space-Track caps a single response; we page on EPOCH until a short page arrives.
     """
     if not norad_ids:
         raise ValueError("No NORAD IDs provided for Space-Track query")
 
     id_csv = ",".join(str(int(i)) for i in norad_ids[:200])  # cap batch size
-    query = (
-        f"{BASE_URL}/basicspacedata/query/class/gp_history/"
-        f"NORAD_CAT_ID/{id_csv}/"
-        f"EPOCH/>now-{epoch_days}/"
-        f"orderby/EPOCH asc/limit/{limit}/format/json"
-    )
+    all_records: list[dict[str, Any]] = []
+    epoch_pred = f">now-{epoch_days}"
 
     with requests.Session() as session:
         _login(session)
-        resp = session.get(query, timeout=120)
-        resp.raise_for_status()
-        data = resp.json()
+        while True:
+            query = (
+                f"{BASE_URL}/basicspacedata/query/class/gp_history/"
+                f"NORAD_CAT_ID/{id_csv}/"
+                f"EPOCH/{epoch_pred}/"
+                f"orderby/EPOCH asc/limit/{limit}/format/json"
+            )
+            resp = session.get(query, timeout=120)
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, list):
+                raise ValueError(f"Unexpected Space-Track response type: {type(data)}")
+            if len(data) == limit:
+                logger.warning(
+                    "Space-Track gp_history page returned len==limit (%d); paginating",
+                    limit,
+                )
+            all_records.extend(data)
+            if len(data) < limit:
+                break
+            last_epoch = data[-1].get("EPOCH")
+            if not last_epoch:
+                break
+            # exclusive lower bound so the last row is not duplicated
+            epoch_pred = f">{last_epoch}"
 
-    if not isinstance(data, list):
-        raise ValueError(f"Unexpected Space-Track response type: {type(data)}")
-
-    return _records_to_dataframe(data, progress_callback=progress_callback)
+    return _records_to_dataframe(all_records, progress_callback=progress_callback)
 
 
 def fetch_recent_gp(

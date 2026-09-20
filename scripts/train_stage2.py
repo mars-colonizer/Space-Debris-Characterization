@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Train class-conditioned Stage 2 sizing, shape, and rotation models."""
+"""Phase 3 Stage 2: class-conditioned physical regression (LOOCV, small-N RF)."""
 
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
-from sklearn.dummy import DummyClassifier
-from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.model_selection import LeaveOneOut, cross_val_predict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -18,208 +21,223 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.config import (
     CLASS_COL,
     DATA_PROCESSED,
-    MIN_STAGE2_SAMPLES_PER_CLASS,
     MODELS_DIR,
-    NON_FEATURE_COLUMNS,
+    PHOTOMETRIC_FEATURE_COLS,
     RANDOM_SEED,
-    RESULTS_DIR,
-    STAGE2_PERIOD_TARGET,
-    STAGE2_SHAPE_TARGET,
-    STAGE2_SIZE_TARGETS,
-    STAGE2_TUMBLING_TARGET,
-    STAGE2_TARGETS,
-)
-from src.evaluation.metrics import evaluate_regressor, save_stage2_metrics
-from src.models.stage1_classifier import build_preprocessor, load_stage1_model, predict_with_confidence
-from src.models.stage2_regressor import (
-    _available_targets,
-    _safe_class_name,
-    build_rotation_pipelines,
-    build_shape_pipeline,
-    build_size_pipeline,
-    save_stage2_models,
 )
 from src.utils import terminal as term
 
-ALL_LABEL_COLS = (
-    STAGE2_SIZE_TARGETS
-    + [STAGE2_SHAPE_TARGET, STAGE2_PERIOD_TARGET, STAGE2_TUMBLING_TARGET]
-    + ["length", "width", "height", "mass", "shape"]
-)
+MATRIX_PATH = DATA_PROCESSED / "phase3_feature_matrix.csv"
+OUT_DIR = MODELS_DIR / "stage2"
+FILL_VALUE = -1.0
+MIN_SAMPLES = 5
+
+ORBITAL_FEATURES = [
+    "inclination",
+    "eccentricity",
+    "semi_major_axis",
+    "raan",
+    "arg_perigee",
+    "mean_anomaly",
+    "orbital_period_days",
+    "inclination_drift_deg_per_day",
+    "sma_decay_km_per_day",
+    "epoch_count",
+    "epoch_span_days",
+]
+FUSED_FEATURES = ORBITAL_FEATURES + list(PHOTOMETRIC_FEATURE_COLS)
+
+# Preference order for continuous DISCOS physical targets.
+TARGET_CANDIDATES = [
+    "mass",
+    "true_mass",
+    "length",
+    "true_length",
+    "width",
+    "true_width",
+    "height",
+    "true_height",
+    "cross_section",
+    "rcs",
+]
+
+CLASS_ORDER = ["Payload", "Rocket Body", "Debris"]
 
 
-def _get_xy(df: pd.DataFrame, size_targets: list[str]) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    drop_cols = NON_FEATURE_COLUMNS + [CLASS_COL] + [c for c in ALL_LABEL_COLS if c not in size_targets]
-    feature_cols = [c for c in df.columns if c not in drop_cols and c not in ALL_LABEL_COLS]
-    return df[feature_cols], df[size_targets], feature_cols
+def _safe_class_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(name).strip().lower()).strip("_") or "class"
 
 
-def _fmt_metric(val: float | None) -> str:
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return "N/A"
-    return f"{val:.4f}"
+def select_target_col(df: pd.DataFrame) -> str:
+    """Pick one continuous numerical physical property present in the matrix."""
+    found: list[tuple[str, int]] = []
+    for col in TARGET_CANDIDATES:
+        if col not in df.columns:
+            continue
+        series = pd.to_numeric(df[col], errors="coerce")
+        n = int(series.notna().sum())
+        if n == 0:
+            continue
+        # Require real numeric variation (skip constant / all-NaN after coerce).
+        if series.dropna().nunique() < 2:
+            term.detail(f"skip {col}: <2 unique numeric values", indent=4)
+            continue
+        found.append((col, n))
+        term.detail(f"candidate {col}: {n} non-null", indent=4)
+
+    if not found:
+        raise ValueError(
+            "No continuous physical target found "
+            f"(looked for {TARGET_CANDIDATES}). Check DISCOS columns in the matrix."
+        )
+    # Prefer mass* then first candidate with the most labels.
+    for preferred in ("mass", "true_mass"):
+        for col, n in found:
+            if col == preferred:
+                return col
+    found.sort(key=lambda x: (-x[1], TARGET_CANDIDATES.index(x[0]) if x[0] in TARGET_CANDIDATES else 99))
+    return found[0][0]
+
+
+def build_regressor() -> RandomForestRegressor:
+    return RandomForestRegressor(
+        n_estimators=50,
+        max_depth=3,
+        random_state=RANDOM_SEED,
+    )
+
+
+def loocv_metrics(X: pd.DataFrame, y: np.ndarray) -> tuple[float, float]:
+    model = build_regressor()
+    preds = cross_val_predict(model, X, y, cv=LeaveOneOut())
+    mae = float(mean_absolute_error(y, preds))
+    r2 = float(r2_score(y, preds))
+    return mae, r2
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train Stage 2 models")
+    parser = argparse.ArgumentParser(description="Phase 3 Stage 2 physical regression")
     term.add_verbosity_args(parser)
     args = parser.parse_args()
     term.configure_from_args(args)
     timer = term.ScriptTimer()
 
-    term.banner("PHASE 2 — STAGE 2 PHYSICAL CHARACTERIZATION")
+    term.banner("PHASE 3 — STAGE 2 PHYSICAL REGRESSION")
 
     try:
-        train_path = DATA_PROCESSED / "train.csv"
-        test_path = DATA_PROCESSED / "test.csv"
-        if not train_path.exists():
-            term.fail("STAGE 2 TRAINING FAILED", f"{train_path} not found", ["Run scripts/prepare_dataset.py first"])
+        if not MATRIX_PATH.is_file():
+            term.fail(
+                "STAGE 2 TRAINING FAILED",
+                f"{MATRIX_PATH} not found",
+                ["Run scripts/prepare_dataset.py first"],
+            )
 
-        train_df = pd.read_csv(train_path)
-        test_df = pd.read_csv(test_path)
+        df = pd.read_csv(MATRIX_PATH)
+        term.ok(f"Loaded {MATRIX_PATH.relative_to(PROJECT_ROOT)} — shape {df.shape}")
 
-        available_targets = [t for t in STAGE2_SIZE_TARGETS if t in train_df.columns and train_df[t].notna().sum() > 0]
-        if not available_targets:
-            # fallback legacy column names
-            legacy = {"length": "true_length", "width": "true_width", "height": "true_height"}
-            for old, new in legacy.items():
-                if old in train_df.columns and new not in train_df.columns:
-                    train_df[new] = train_df[old]
-                    test_df[new] = test_df[old]
-            available_targets = [t for t in STAGE2_SIZE_TARGETS if t in train_df.columns and train_df[t].notna().sum() > 0]
-        if not available_targets:
-            term.fail("STAGE 2 TRAINING FAILED", "No Stage 2 size targets available in training data")
+        missing_feats = [c for c in FUSED_FEATURES if c not in df.columns]
+        if missing_feats:
+            raise ValueError(f"Matrix missing fused features: {missing_feats}")
+        if CLASS_COL not in df.columns:
+            raise ValueError(f"Matrix missing {CLASS_COL}")
 
-        term.info("Size targets:")
-        for t in available_targets:
-            term.detail(t, indent=4)
-        term.line()
+        term.info("Scanning DISCOS physical targets...")
+        target_col = select_target_col(df)
+        term.ok(f"Primary regression target: {target_col}")
 
-        all_classes = sorted(train_df[CLASS_COL].dropna().unique())
-        X_train, y_train, feature_names = _get_xy(train_df, available_targets)
-        targets = _available_targets(y_train, available_targets)
-        if not targets:
-            term.fail("STAGE 2 TRAINING FAILED", "No valid regression targets with sufficient samples")
+        work = df.copy()
+        work[target_col] = pd.to_numeric(work[target_col], errors="coerce")
+        before = len(work)
+        work = work.dropna(subset=[target_col]).reset_index(drop=True)
+        term.ok(f"Rows with {target_col}: {term.fmt_n(len(work))} (dropped {term.fmt_n(before - len(work))})")
 
-        size_models: dict[str, Pipeline] = {}
-        shape_models: dict[str, Pipeline] = {}
-        rotation_models: dict[str, dict] = {}
-        skipped: list[str] = []
-        class_metrics: list[dict] = []
+        X_all = work[FUSED_FEATURES].apply(pd.to_numeric, errors="coerce").fillna(FILL_VALUE)
+        y_all = work[target_col].to_numpy(dtype=float)
 
-        for idx, cls in enumerate(all_classes, start=1):
-            term.section(f"CLASS {idx}/{len(all_classes)} — {cls.upper()}")
-            mask = train_df[CLASS_COL] == cls
+        classes = [c for c in CLASS_ORDER if c in set(work[CLASS_COL].astype(str))]
+        for extra in sorted(set(work[CLASS_COL].astype(str)) - set(classes)):
+            classes.append(extra)
+
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+        rows: list[dict[str, object]] = []
+
+        for cls in classes:
+            mask = work[CLASS_COL].astype(str) == cls
             n = int(mask.sum())
-            term.line(f"Training samples: {term.fmt_n(n)}")
+            term.section(f"{cls} (n={n})")
 
-            if n < MIN_STAGE2_SAMPLES_PER_CLASS:
-                term.warn(f"Insufficient samples for class '{cls}' ({n} < {MIN_STAGE2_SAMPLES_PER_CLASS})")
-                skipped.append(cls)
+            if n < MIN_SAMPLES:
+                term.warn(f"Skipping '{cls}' — {n} < {MIN_SAMPLES} valid samples")
+                rows.append(
+                    {
+                        "class": cls,
+                        "target": target_col,
+                        "n": n,
+                        "mae": None,
+                        "r2": None,
+                        "skipped": True,
+                    }
+                )
                 continue
 
-            y_cls = y_train.loc[mask, targets]
-            complete = y_cls.notna().all(axis=1)
-            if complete.sum() < MIN_STAGE2_SAMPLES_PER_CLASS:
-                term.warn(f"Insufficient complete target rows for class '{cls}'")
-                skipped.append(cls)
-                continue
+            X = X_all.loc[mask]
+            y = y_all[mask.to_numpy()]
 
-            X_cls = X_train.loc[mask].loc[complete]
-            y_cls = y_cls.loc[complete]
+            term.step(1, 2, "Leave-One-Out CV...")
+            mae, r2 = loocv_metrics(X, y)
+            term.ok(f"LOOCV MAE={mae:.4f}  R²={r2:.4f}")
 
-            term.step(1, 4, "Training size regressors...")
-            size_pipe = build_size_pipeline(feature_names)
-            with term.timed(f"{cls} size training"):
-                size_pipe.fit(X_cls, y_cls.values)
-            size_models[cls] = size_pipe
-            term.ok("Size model trained")
+            term.step(2, 2, "Fit final regressor on all class samples...")
+            final = build_regressor()
+            final.fit(X, y)
+            out_path = OUT_DIR / f"regressor_{_safe_class_name(cls)}.pkl"
+            joblib.dump(
+                {
+                    "model": final,
+                    "target_col": target_col,
+                    "feature_names": list(FUSED_FEATURES),
+                    "object_class": cls,
+                    "fill_value": FILL_VALUE,
+                    "n_samples": n,
+                    "loocv_mae": mae,
+                    "loocv_r2": r2,
+                },
+                out_path,
+            )
+            term.ok(f"Saved {out_path.relative_to(PROJECT_ROOT)}")
 
-            term.step(2, 4, "Training shape classifier...")
-            if STAGE2_SHAPE_TARGET in train_df.columns:
-                y_shape = train_df.loc[X_cls.index, STAGE2_SHAPE_TARGET].dropna()
-                if len(y_shape) >= MIN_STAGE2_SAMPLES_PER_CLASS:
-                    shape_pipe = build_shape_pipeline(feature_names)
-                    if y_shape.nunique() < 2:
-                        shape_pipe = Pipeline([
-                            ("preprocessor", build_preprocessor(feature_names)),
-                            ("clf", DummyClassifier(strategy="most_frequent")),
-                        ])
-                    shape_pipe.fit(X_cls.loc[y_shape.index], y_shape)
-                    shape_models[cls] = shape_pipe
-                    term.ok(f"Shape model trained ({y_shape.nunique()} label(s))")
-                else:
-                    term.warn("Shape target insufficient — skipped")
+            rows.append(
+                {
+                    "class": cls,
+                    "target": target_col,
+                    "n": n,
+                    "mae": mae,
+                    "r2": r2,
+                    "skipped": False,
+                }
+            )
+
+        term.banner("STAGE 2 — LOOCV RESULTS")
+        term.line("")
+        term.line("| Class | Target Variable | N-samples | LOOCV MAE | LOOCV R2 |")
+        term.line("|---|---|---:|---:|---:|")
+        for row in rows:
+            if row["skipped"]:
+                term.line(
+                    f"| {row['class']} | {row['target']} | {row['n']} | — (skipped) | — |"
+                )
             else:
-                term.warn("No true_shape column — shape model skipped")
+                term.line(
+                    f"| {row['class']} | {row['target']} | {row['n']} | "
+                    f"{row['mae']:.4f} | {row['r2']:.4f} |"
+                )
+        term.line("")
 
-            term.step(3, 4, "Training rotation estimator...")
-            rot_bundle: dict = {}
-            if STAGE2_PERIOD_TARGET in train_df.columns:
-                y_period = train_df.loc[X_cls.index, STAGE2_PERIOD_TARGET].dropna()
-                if len(y_period) >= MIN_STAGE2_SAMPLES_PER_CLASS:
-                    pipes = build_rotation_pipelines(feature_names)
-                    pipes["period"].fit(X_cls.loc[y_period.index], y_period)
-                    rot_bundle["period"] = pipes["period"]
-                    term.ok("Spin period regressor trained")
-            if STAGE2_TUMBLING_TARGET in train_df.columns:
-                y_tumble = train_df.loc[X_cls.index, STAGE2_TUMBLING_TARGET].dropna().astype(int)
-                if len(y_tumble) >= MIN_STAGE2_SAMPLES_PER_CLASS:
-                    pipes = build_rotation_pipelines(feature_names)
-                    if y_tumble.nunique() < 2:
-                        pipes["tumbling"] = Pipeline([
-                            ("preprocessor", build_preprocessor(feature_names)),
-                            ("clf", DummyClassifier(strategy="most_frequent")),
-                        ])
-                    pipes["tumbling"].fit(X_cls.loc[y_tumble.index], y_tumble)
-                    rot_bundle["tumbling"] = pipes["tumbling"]
-                    term.ok("Tumbling classifier trained")
-            if rot_bundle:
-                rotation_models[cls] = rot_bundle
+        trained = sum(1 for r in rows if not r["skipped"])
+        if trained == 0:
+            term.fail("STAGE 2 TRAINING FAILED", "No class had enough samples to train")
 
-            term.step(4, 4, "In-sample size metrics...")
-            preds = size_pipe.predict(X_cls)
-            for i, target in enumerate(targets):
-                m = evaluate_regressor(y_cls[target], preds[:, i], cls, target)
-                class_metrics.append(m)
-                term.info(f"{target}: MAE={_fmt_metric(m['mae'])} R²={_fmt_metric(m['r2'])}", indent=4)
-
-            term.ok(f"Models saved: models/stage2/{_safe_class_name(cls)}*.joblib")
-
-        if not size_models:
-            term.fail("STAGE 2 TRAINING FAILED", "No class-conditioned models could be trained")
-
-        save_stage2_models(size_models, targets, MODELS_DIR, shape_models, rotation_models)
-
-        X_test, y_test, _ = _get_xy(test_df, targets)
-        metrics_list = []
-        for cls in size_models:
-            mask = test_df[CLASS_COL] == cls
-            if mask.sum() == 0:
-                continue
-            preds = size_models[cls].predict(X_test.loc[mask])
-            for i, target in enumerate(targets):
-                m = evaluate_regressor(y_test.loc[mask, target], preds[:, i], cls, target)
-                m["eval_mode"] = "true_class"
-                metrics_list.append(m)
-
-        metrics_path = RESULTS_DIR / "stage2_metrics.csv"
-        save_stage2_metrics(metrics_list, metrics_path)
-
-        term.banner("STAGE 2 — SUMMARY")
-        term.print_table(
-            ["Class", "Samples", "Size", "Shape", "Rotation"],
-            [[
-                cls,
-                str(int((train_df[CLASS_COL] == cls).sum())),
-                "OK" if cls in size_models else "SKIP",
-                "OK" if cls in shape_models else "SKIP",
-                "OK" if cls in rotation_models else "SKIP",
-            ] for cls in all_classes],
-        )
-        term.ok(f"Size models: {term.fmt_n(len(size_models))}", force=True)
-        term.ok(f"Shape models: {term.fmt_n(len(shape_models))}", force=True)
-        term.ok(f"Rotation models: {term.fmt_n(len(rotation_models))}", force=True)
+        term.banner("STAGE 2 TRAINING COMPLETE")
         timer.print_total()
 
     except Exception as exc:

@@ -1,4 +1,4 @@
-/** Phase 2 Control Dashboard — client logic */
+/** AI-Enabled Space Situational Awareness — dashboard client */
 
 const STEP_ICONS = {
   WAITING: { icon: "○", cls: "step-waiting" },
@@ -58,6 +58,19 @@ function formatElapsed(sec) {
   return `${m}m ${s}s`;
 }
 
+function fmtNum(n) {
+  if (n == null || n === "—") return "—";
+  return Number(n).toLocaleString();
+}
+
+function fmtPeriod(sec) {
+  if (sec == null || sec === "—") return "—";
+  const s = Number(sec);
+  if (s >= 3600) return `${(s / 3600).toFixed(2)} h`;
+  if (s >= 60) return `${(s / 60).toFixed(2)} min`;
+  return `${s.toFixed(2)} s`;
+}
+
 function updateStatusUI(data) {
   pipelineStatus = data.pipeline_status || "IDLE";
   startTime = data.start_time || null;
@@ -76,15 +89,18 @@ function updateStatusUI(data) {
   $("#btn-run-full").disabled = running;
   $("#btn-stop").disabled = !running;
   $("#btn-reset-all").disabled = running;
+  const phase3Btn = $("#btn-run-phase3");
+  if (phase3Btn) phase3Btn.disabled = running;
   document.querySelectorAll(".stage-btn").forEach((b) => (b.disabled = running));
   document.querySelectorAll(".mode-btn").forEach((b) => (b.disabled = running));
 
   if (data.stage_status) renderStepper(data.stage_status);
 
   const errBanner = $("#error-banner");
-  if (pipelineStatus === "FAILED" && data.failed_error) {
+  if ((pipelineStatus === "FAILED" || pipelineStatus === "STOPPED") && data.failed_error) {
     errBanner.classList.remove("hidden");
-    errBanner.textContent = `Failed at ${data.failed_stage || "unknown"}: ${data.failed_error}`;
+    const prefix = pipelineStatus === "STOPPED" ? "Stopped" : "Failed";
+    errBanner.textContent = `${prefix} at ${data.failed_stage || "unknown"}: ${data.failed_error}`;
   } else {
     errBanner.classList.add("hidden");
   }
@@ -92,7 +108,7 @@ function updateStatusUI(data) {
   if (running && startTime) {
     if (!elapsedTimer) {
       elapsedTimer = setInterval(() => {
-        const sec = (Date.now() / 1000) - startTime;
+        const sec = Date.now() / 1000 - startTime;
         $("#elapsed").textContent = formatElapsed(sec);
       }, 500);
     }
@@ -139,6 +155,15 @@ async function runPipeline() {
   }
 }
 
+async function runPhase3() {
+  try {
+    clearTerminalView();
+    await api("POST", "/api/run-phase3");
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
 async function runStage(name) {
   try {
     await api("POST", `/api/run-stage/${name}`);
@@ -155,112 +180,341 @@ async function stopPipeline() {
   }
 }
 
-function fmtNum(n) {
-  if (n == null || n === "—") return "—";
-  return Number(n).toLocaleString();
+function renderIngestion(ing) {
+  let html = "";
+  if (ing.source) html += `<div class="text-xs text-gray-400 mb-1">Mode: <strong>${ing.source}</strong></div>`;
+  if (ing.mmt_ok) {
+    html += `<div>Observations: <strong>${fmtNum(ing.mmt_points)}</strong></div>`;
+    html += `<div>Objects with photometry: <strong>${fmtNum(ing.mmt_objects)}</strong></div>`;
+    html += `<div class="text-green-600">MMT-9: ✓</div>`;
+  } else {
+    html += `<div>MMT-9: ○ (no data)</div>`;
+  }
+  if (ing.source === "ACTUAL") {
+    html += `<div class="text-xs text-gray-400 mt-2 pt-2 border-t">TLE/DISCOS are fetched in step 3 only after KeepTrack COSPAR resolution.</div>`;
+  }
+  $("#ingestion-content").innerHTML = html || "No data yet.";
 }
 
-function renderMetrics(m) {
-  const ing = m.ingestion || {};
-  let ingHtml = "";
-  if (ing.tle_ok) {
-    ingHtml += `<div>Space-Track GP records: <strong>${fmtNum(ing.gp_records)}</strong></div>`;
-    ingHtml += `<div>NORAD IDs: <strong>${fmtNum(ing.norad_ids)}</strong></div>`;
-    ingHtml += `<div class="text-green-600">Space-Track: ✓</div>`;
-  } else ingHtml += `<div>Space-Track: ○ (no data)</div>`;
-  if (ing.discos_ok) {
-    ingHtml += `<div>DISCOS objects: <strong>${fmtNum(ing.discos_objects)}</strong></div>`;
-    ingHtml += `<div class="text-green-600">DISCOS: ✓</div>`;
-  } else ingHtml += `<div>DISCOS: ○ (no data)</div>`;
-  $("#ingestion-content").innerHTML = ingHtml || "No data yet.";
+function renderIdentifiers(ids) {
+  if (!ids.identifiers_ok && !ids.lc_objects) {
+    $("#identifiers-content").innerHTML = "Run ingestion first.";
+    return;
+  }
+  let html = "";
+  if (ids.lc_objects != null) {
+    html += `<div>MMT objects (light curves): <strong>${fmtNum(ids.lc_objects)}</strong></div>`;
+    html += `<div>Observations: <strong>${fmtNum(ids.lc_points)}</strong></div>`;
+  }
+  if (ids.total_objects != null) {
+    html += `<div class="mt-1 pt-1 border-t">KeepTrack COSPAR resolved: <strong>${fmtNum(ids.cospar_resolved)}</strong></div>`;
+    html += `<div>No COSPAR (metadata skipped): <strong>${fmtNum(ids.cospar_missing)}</strong></div>`;
+    html += `<div>Resolution rate: <strong>${ids.coverage_pct ?? "—"}%</strong></div>`;
+  }
+  if (ids.lc_objects_with_cospar != null) {
+    html += `<div class="text-xs text-gray-400 mt-1">Eligible for TLE/DISCOS: <strong>${fmtNum(ids.lc_objects_with_cospar)}</strong> objects</div>`;
+  }
+  $("#identifiers-content").innerHTML = html || "Run ingestion first.";
+}
 
-  const merge = m.merge || {};
-  const meta = m.dataset_meta || {};
-  let qHtml = "";
-  if (ing.gp_records) qHtml += `<div>TLE records: <strong>${fmtNum(ing.gp_records)}</strong></div>`;
-  if (ing.tle_objects) qHtml += `<div>Unique TLE objects: <strong>${fmtNum(ing.tle_objects)}</strong></div>`;
-  if (merge.matched_objects != null) qHtml += `<div>Matched objects: <strong>${fmtNum(merge.matched_objects)}</strong></div>`;
-  if (merge.unmatched_tle_objects != null) qHtml += `<div>Unmatched TLE: <strong>${fmtNum(merge.unmatched_tle_objects)}</strong></div>`;
-  if (meta.train_objects != null) qHtml += `<div>Train objects: <strong>${fmtNum(meta.train_objects)}</strong></div>`;
-  if (meta.test_objects != null) qHtml += `<div>Test objects: <strong>${fmtNum(meta.test_objects)}</strong></div>`;
-  if (m.class_count) qHtml += `<div>Classes: <strong>${m.class_count}</strong></div>`;
-  $("#quality-content").innerHTML = qHtml || "Run preparation to populate.";
-
-  const photo = m.photometry || {};
-  if (photo.photo_ok) {
-    const src = photo.source ? ` · <span class="text-gray-400">${photo.source}</span>` : "";
-    $("#photometry-content").innerHTML = `
-      <div>Observations: <strong>${fmtNum(photo.obs_count)}</strong></div>
-      <div>Objects with photometry: <strong>${fmtNum(photo.object_count)}</strong></div>
-      <div>Avg amplitude (Δm): <strong>${photo.avg_delta_mag ?? "—"}</strong></div>
-      <div>Max amplitude (Δm): <strong>${photo.max_delta_mag ?? "—"}</strong></div>
-      <div>Tumbling fraction: <strong>${photo.tumbling_fraction != null ? (photo.tumbling_fraction * 100).toFixed(1) + "%" : "—"}</strong></div>
-      <div class="text-xs mt-1">Source: <strong>${photo.source || "—"}</strong></div>`;
+function renderMetadata(meta) {
+  if (!meta.mmt_objects && !meta.metadata_eligible) {
+    $("#metadata-content").innerHTML = "Awaiting KeepTrack resolution.";
+    return;
+  }
+  let html = "";
+  if (meta.gated) {
+    html += `<div class="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded px-2 py-1 mb-2">KeepTrack-gated: TLE + DISCOS only for resolved MMT objects</div>`;
+    if (!meta.keeptrack_enabled) {
+      html += `<div class="text-amber-700">KeepTrack API key not set — TLE/DISCOS skipped</div>`;
+    }
+  }
+  html += `<div>MMT objects: <strong>${fmtNum(meta.mmt_objects)}</strong></div>`;
+  html += `<div>Eligible (KeepTrack COSPAR): <strong>${fmtNum(meta.metadata_eligible)}</strong></div>`;
+  if (meta.metadata_skipped > 0) {
+    html += `<div class="text-amber-700">Skipped (no COSPAR): <strong>${fmtNum(meta.metadata_skipped)}</strong></div>`;
+  }
+  html += `<div class="mt-1 pt-1 border-t">Space-Track objects fetched: <strong>${fmtNum(meta.tle_objects)}</strong></div>`;
+  if (meta.tle_ok) {
+    html += `<div>GP records: <strong>${fmtNum(meta.gp_records)}</strong></div>`;
+    html += `<div class="text-green-600">Space-Track: ✓</div>`;
   } else {
-    $("#photometry-content").textContent = "No photometric data yet.";
+    html += `<div class="text-gray-400">Space-Track: ○ (not fetched or no eligible objects)</div>`;
   }
-
-  const leak = m.leakage || {};
-  const removed = leak.removed_columns || [];
-  if (removed.length) {
-    const safe = leak.cospar_overlap === 0;
-    $("#leakage-content").innerHTML = `
-      <div class="mb-2">Removed columns:</div>
-      <ul class="list-disc ml-5 mb-2">${removed.map((c) => `<li><code>${c}</code> ✓</li>`).join("")}</ul>
-      <div>Features: <strong>${leak.feature_count ?? "—"}</strong></div>
-      <div>COSPAR overlap: <strong>${leak.cospar_overlap ?? 0}</strong></div>
-      <span class="inline-block mt-2 px-2 py-0.5 rounded text-xs font-bold ${safe ? "bg-green-100 text-green-800" : "bg-red-100 text-red-800"}">${safe ? "STATUS: ✓ SAFE" : "STATUS: ✕ LEAKAGE"}</span>`;
+  if (meta.discos_ok) {
+    html += `<div>DISCOS objects: <strong>${fmtNum(meta.discos_objects)}</strong></div>`;
+    html += `<div class="text-green-600">DISCOS: ✓</div>`;
   } else {
-    $("#leakage-content").textContent = "Available after data preparation.";
+    html += `<div class="text-gray-400">DISCOS: ○ (not fetched or no eligible objects)</div>`;
   }
+  $("#metadata-content").innerHTML = html;
+}
 
-  const s1 = m.stage1 || [];
-  if (s1.length) {
-    const cols = ["model", "accuracy", "precision", "recall", "f1"];
-    $("#stage1-content").innerHTML = `<table class="min-w-full text-xs"><thead><tr>${cols.map((c) => `<th class="text-left pr-3 py-1">${c}</th>`).join("")}</tr></thead><tbody>${s1.map((row) => `<tr>${cols.map((c) => `<td class="pr-3 py-1">${row[c] != null ? (typeof row[c] === "number" ? row[c].toFixed(4) : row[c]) : "—"}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+function renderDatabase(db) {
+  if (!db.database_ok) {
+    $("#database-content").innerHTML = `<div class="text-gray-400">Database empty.</div><div class="text-xs mt-1">${db.db_path || "data/database/rso_poc.db"}</div>`;
+    return;
+  }
+  $("#database-content").innerHTML = `
+    <div class="text-xs text-gray-400 mb-1">${db.db_path || "rso_poc.db"}</div>
+    <div>Objects: <strong>${fmtNum(db.objects_count)}</strong></div>
+    <div>Light curves: <strong>${fmtNum(db.light_curves_count)}</strong></div>
+    <div>Periodograms: <strong>${fmtNum(db.periodograms_count)}</strong></div>
+    <div>Folded curves: <strong>${fmtNum(db.folded_light_curves_count)}</strong></div>
+    <div>Photometric summaries: <strong>${fmtNum(db.photometric_observations_count)}</strong></div>`;
+}
+
+function renderPeriodAnalysis(pa) {
+  if (!pa.period_ok) {
+    $("#period-content").textContent = "Run photometric processing to populate.";
+    return;
+  }
+  let html = `
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3">
+      <div>In source: <strong>${fmtNum(pa.objects_in_source)}</strong></div>
+      <div>Analyzed: <strong>${fmtNum(pa.objects_analyzed)}</strong></div>
+      <div>Filtered out: <strong>${fmtNum(pa.objects_filtered_out)}</strong></div>
+      <div>Mean PDM θ: <strong>${pa.mean_pdm_theta != null ? pa.mean_pdm_theta.toFixed(4) : "—"}</strong></div>
+      <div>Stable rotators: <strong>${fmtNum(pa.stable_rotators)}</strong></div>
+      <div>Tumbling: <strong>${fmtNum(pa.tumbling)}</strong></div>
+    </div>`;
+
+  const objects = pa.objects || [];
+  if (objects.length) {
+    html += `<div class="overflow-x-auto"><table class="min-w-full text-xs">
+      <thead><tr>
+        <th class="text-left pr-3 py-1">NORAD</th>
+        <th class="text-left pr-3 py-1">Name</th>
+        <th class="text-left pr-3 py-1">LSP P</th>
+        <th class="text-left pr-3 py-1">PDM P</th>
+        <th class="text-left pr-3 py-1">Selected P</th>
+        <th class="text-left pr-3 py-1">PDM θ</th>
+        <th class="text-left pr-3 py-1">Tumbling</th>
+      </tr></thead><tbody>`;
+    html += objects
+      .slice(0, 20)
+      .map(
+        (o) => `<tr>
+          <td class="pr-3 py-1 font-mono">${o.object_id ?? "—"}</td>
+          <td class="pr-3 py-1">${o.object_name ?? "—"}</td>
+          <td class="pr-3 py-1">${fmtPeriod(o.lsp_period_sec)}</td>
+          <td class="pr-3 py-1">${fmtPeriod(o.pdm_period_sec)}</td>
+          <td class="pr-3 py-1">${fmtPeriod(o.extracted_period_sec)}</td>
+          <td class="pr-3 py-1">${o.pdm_theta != null ? Number(o.pdm_theta).toFixed(4) : "—"}</td>
+          <td class="pr-3 py-1">${o.is_tumbling ? "yes" : "no"}</td>
+        </tr>`
+      )
+      .join("");
+    if (objects.length > 20) {
+      html += `<tr><td colspan="7" class="py-1 text-gray-400">… and ${objects.length - 20} more</td></tr>`;
+    }
+    html += `</tbody></table></div>`;
+  }
+  $("#period-content").innerHTML = html;
+}
+
+function renderArtifacts(poc) {
+  if (!poc.plot_count && !poc.periodogram_count) {
+    $("#artifacts-summary").textContent = "No artifacts yet.";
+    $("#artifact-gallery").innerHTML = `<p class="text-sm text-gray-400 col-span-full">Plots appear after photometric processing completes.</p>`;
+    return;
+  }
+  $("#artifacts-summary").innerHTML = `
+    <div>Periodogram &amp; diagnostic plots: <strong>${fmtNum(poc.plot_count)}</strong></div>
+    <div>Periodograms: <strong>${fmtNum(poc.periodogram_count)}</strong></div>
+    <div>Folded curves: <strong>${fmtNum(poc.folded_count)}</strong></div>`;
+
+  const plots = poc.plots || [];
+  if (!plots.length) {
+    $("#artifact-gallery").innerHTML = `<p class="text-sm text-gray-400 col-span-full">No PNG plots on disk yet.</p>`;
+    return;
+  }
+  $("#artifact-gallery").innerHTML = plots
+    .map(
+      (name) => `<a href="/api/artifacts/poc_plots/${encodeURIComponent(name)}" target="_blank" class="artifact-thumb" title="${name}">
+        <img src="/api/artifacts/poc_plots/${encodeURIComponent(name)}" alt="${name}" loading="lazy" />
+        <span class="artifact-label">${name.replace(/^norad_/, "").replace(/\.png$/, "")}</span>
+      </a>`
+    )
+    .join("");
+}
+
+function fmtF1(v) {
+  return v == null || Number.isNaN(Number(v)) ? "—" : Number(v).toFixed(4);
+}
+
+function renderPhase3Characterization(data) {
+  const ablationEl = $("#phase3-ablation-content");
+  const stage2El = $("#phase3-stage2-content");
+  if (!ablationEl || !stage2El) return;
+
+  const ablation = data.ablation || [];
+  if (ablation.length) {
+    ablationEl.innerHTML = `
+      <table class="min-w-full text-sm bg-white rounded border border-slate-200 overflow-hidden">
+        <thead class="bg-slate-100 text-slate-600 text-xs uppercase tracking-wide">
+          <tr>
+            <th class="text-left px-3 py-2">Model</th>
+            <th class="text-right px-3 py-2">Orbital F1</th>
+            <th class="text-right px-3 py-2">Fused F1</th>
+            <th class="text-right px-3 py-2">Δ (Fused−Orb)</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${ablation
+            .map((row) => {
+              const delta = Number(row.fused_f1) - Number(row.orbital_f1);
+              const deltaCls = delta >= 0 ? "text-emerald-700" : "text-rose-700";
+              return `<tr class="border-t border-slate-100">
+                <td class="px-3 py-2 font-medium text-slate-800">${row.model}</td>
+                <td class="px-3 py-2 text-right tabular-nums">${fmtF1(row.orbital_f1)}</td>
+                <td class="px-3 py-2 text-right tabular-nums font-semibold">${fmtF1(row.fused_f1)}</td>
+                <td class="px-3 py-2 text-right tabular-nums ${deltaCls}">${delta >= 0 ? "+" : ""}${delta.toFixed(4)}</td>
+              </tr>`;
+            })
+            .join("")}
+        </tbody>
+      </table>`;
   } else {
-    $("#stage1-content").textContent = "No Stage 1 metrics yet.";
+    ablationEl.textContent = "No ablation metrics available.";
   }
 
-  const s2classes = m.stage2_classes || [];
-  const s2metrics = m.stage2 || [];
-  let s2Html = "";
-  if (s2classes.length) {
-    const trained = s2classes.filter((x) => x.status === "OK").length;
-    const skipped = s2classes.length - trained;
-    s2Html += `<div class="mb-2">Models trained: <strong>${trained}</strong> | Skipped: <strong>${skipped}</strong></div>`;
-    s2Html += `<table class="min-w-full text-xs mb-2"><thead><tr><th class="text-left pr-3">Class</th><th class="text-left pr-3">Samples</th><th>Status</th></tr></thead><tbody>${s2classes.map((r) => `<tr><td class="pr-3">${r.class}</td><td class="pr-3">${r.samples}</td><td>${r.status === "OK" ? "✓" : r.status === "insufficient" ? "⚠ insufficient" : "○"}</td></tr>`).join("")}</tbody></table>`;
+  const stage2 = data.stage2 || [];
+  if (stage2.length) {
+    stage2El.innerHTML = `
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        ${stage2
+          .map(
+            (row) => `
+          <div class="bg-white border border-slate-200 rounded-lg p-3 shadow-sm">
+            <div class="text-xs uppercase tracking-wide text-slate-500">${row.class}</div>
+            <div class="text-sm text-slate-700 mt-1">Target: <strong>${row.target || "mass"}</strong> · n=${fmtNum(row.n_samples)}</div>
+            <div class="mt-3 grid grid-cols-2 gap-2">
+              <div class="rounded bg-slate-50 px-2 py-2">
+                <div class="text-[10px] uppercase text-slate-400">LOOCV MAE</div>
+                <div class="text-base font-semibold tabular-nums text-slate-800">${Number(row.mae).toFixed(2)}</div>
+              </div>
+              <div class="rounded bg-slate-50 px-2 py-2">
+                <div class="text-[10px] uppercase text-slate-400">LOOCV R²</div>
+                <div class="text-base font-semibold tabular-nums text-slate-800">${Number(row.r2).toFixed(4)}</div>
+              </div>
+            </div>
+          </div>`
+          )
+          .join("")}
+      </div>`;
+  } else {
+    stage2El.textContent = "No Stage 2 mass-regression metrics available.";
   }
-  if (s2metrics.length) {
-    const cols = ["object_class", "target", "mae", "rmse", "r2"];
-    s2Html += `<table class="min-w-full text-xs"><thead><tr>${cols.map((c) => `<th class="text-left pr-3 py-1">${c}</th>`).join("")}</tr></thead><tbody>${s2metrics.map((row) => `<tr>${cols.map((c) => `<td class="pr-3 py-1">${row[c] != null ? (typeof row[c] === "number" ? row[c].toFixed(4) : row[c]) : "—"}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
-  }
-  $("#stage2-content").innerHTML = s2Html || "No Stage 2 metrics yet.";
 
-  const inf = m.inference || {};
+  const bust = `?t=${Date.now()}`;
+  const images = data.images || {};
+  const cm = images.confusion_matrix || "/phase3_images/confusion_matrix.png";
+  const shap = images.shap_feature_importance || "/phase3_images/shap_feature_importance.png";
+  const cmImg = $("#phase3-cm-img");
+  const shapImg = $("#phase3-shap-img");
+  const cmLink = $("#phase3-cm-link");
+  const shapLink = $("#phase3-shap-link");
+  if (cmImg) {
+    cmImg.classList.remove("hidden");
+    cmImg.onerror = () => showXaiFallback("cm");
+    cmImg.onload = () => {
+      const fb = $("#phase3-cm-fallback");
+      if (fb) fb.classList.add("hidden");
+      cmImg.classList.remove("hidden");
+    };
+    cmImg.src = cm + bust;
+  }
+  if (shapImg) {
+    shapImg.classList.remove("hidden");
+    shapImg.onerror = () => showXaiFallback("shap");
+    shapImg.onload = () => {
+      const fb = $("#phase3-shap-fallback");
+      if (fb) fb.classList.add("hidden");
+      shapImg.classList.remove("hidden");
+    };
+    shapImg.src = shap + bust;
+  }
+  if (cmLink) cmLink.href = cm;
+  if (shapLink) shapLink.href = shap;
+}
+
+function showXaiFallback(kind) {
+  const img = kind === "cm" ? $("#phase3-cm-img") : $("#phase3-shap-img");
+  const fb = kind === "cm" ? $("#phase3-cm-fallback") : $("#phase3-shap-fallback");
+  if (img) img.classList.add("hidden");
+  if (fb) fb.classList.remove("hidden");
+}
+
+async function loadPhase3Metrics() {
+  try {
+    const data = await api("GET", "/api/phase3/metrics");
+    renderPhase3Characterization(data);
+  } catch (e) {
+    console.warn("phase3 metrics load failed:", e.message);
+    const ablationEl = $("#phase3-ablation-content");
+    const stage2El = $("#phase3-stage2-content");
+    if (ablationEl) ablationEl.textContent = "Failed to load Phase 3 metrics.";
+    if (stage2El) stage2El.textContent = "Failed to load Phase 3 metrics.";
+  }
+}
+
+function renderPhase3(p3, inference) {
+  const infEl = $("#inference-content");
+  if (!infEl) return;
+
+  const inf = inference || p3.inference || {};
   if (Object.keys(inf).length) {
-    const L = inf.length || "—", W = inf.width || "—", H = inf.height || "—";
-    $("#inference-content").innerHTML = `
+    const massNum = inf.mass != null && inf.mass !== "" && !Number.isNaN(Number(inf.mass));
+    const massLabel = massNum
+      ? `${Number(inf.mass).toFixed(2)} kg`
+      : (inf.mass_status || "n/a (no Stage 2 model)");
+    const dims = (inf.length || inf.width || inf.height)
+      ? `<div>Sizing (L × W × H): <strong>${inf.length || "—"} × ${inf.width || "—"} × ${inf.height || "—"}</strong> m</div>`
+      : "";
+    infEl.innerHTML = `
       <div class="grid grid-cols-2 gap-2">
         <div>COSPAR ID: <strong>${inf.cospar_id || "—"}</strong></div>
         <div>Confidence: <strong>${inf.confidence || "—"}%</strong></div>
         <div>True class: <strong>${inf.true_class || "—"}</strong></div>
         <div>Predicted: <strong>${inf.predicted_class || "—"}</strong></div>
       </div>
-      <div class="mt-2">Sizing (L × W × H): <strong>${L} × ${W} × ${H}</strong> m</div>
-      <div class="mt-2">Shape: <strong>${inf.shape || "—"}</strong></div>
-      <div>Spin period: <strong>${inf.spin_period || "—"}</strong> s · Tumbling: <strong>${inf.tumbling || "—"}</strong></div>
-      <div class="text-xs text-gray-500 mt-1">Latency: ${inf.latency_seconds || "—"} s</div>`;
+      <div class="mt-2">Estimated mass: <strong>${massLabel}</strong></div>
+      ${dims}
+      <div>Spin period: <strong>${inf.spin_period || "—"}</strong> s · Tumbling: <strong>${inf.tumbling || "—"}</strong></div>`;
   } else {
-    $("#inference-content").textContent = "Run inference to see results.";
+    infEl.textContent = "Run inference to see results.";
   }
 }
+
+function renderMetrics(m) {
+  renderIngestion(m.ingestion || {});
+  renderIdentifiers(m.identifiers || {});
+  renderMetadata(m.metadata || {});
+  renderDatabase(m.database || {});
+  renderPeriodAnalysis(m.period_analysis || {});
+  renderArtifacts(m.poc_artifacts || {});
+  renderPhase3(m.phase3 || {}, m.inference_result);
+}
+
+let metricsTimer = null;
 
 async function loadMetrics() {
   try {
     const m = await api("GET", "/api/metrics");
     renderMetrics(m);
-  } catch (_) { /* ignore */ }
+  } catch (e) {
+    console.warn("metrics load failed:", e.message);
+  }
+}
+
+function scheduleMetricsRefresh() {
+  if (metricsTimer) return;
+  metricsTimer = setTimeout(async () => {
+    metricsTimer = null;
+    await loadMetrics();
+    await loadPhase3Metrics();
+  }, 250);
 }
 
 function renderRuns(runs) {
@@ -276,8 +530,8 @@ function renderRuns(runs) {
         <td class="py-2 pr-4">${r.start_time || "—"}</td>
         <td class="py-2 pr-4">${r.status || "—"}</td>
         <td class="py-2 pr-4">${r.duration_sec != null ? r.duration_sec + "s" : "—"}</td>
-        <td class="py-2 pr-4 text-xs">${(r.stages || []).join(", ") || "—"}</td>
-        <td class="py-2"><button class="btn-delete-run text-red-600 hover:text-red-800 text-sm" data-run-id="${r.run_id}" title="Delete run">🗑️ Delete</button></td>
+        <td class="py-2 pr-4 text-xs">${(r.exec_keys || r.stages || []).join(", ") || "—"}</td>
+        <td class="py-2"><button class="btn-delete-run text-red-600 hover:text-red-800 text-sm" data-run-id="${r.run_id}" title="Delete run">Delete</button></td>
       </tr>`
     )
     .join("");
@@ -307,7 +561,7 @@ async function deleteRun(runId) {
 }
 
 async function clearAllRuns() {
-  if (!confirm("Are you sure you want to delete all historical run data?")) return;
+  if (!confirm("Delete all historical run logs?")) return;
   try {
     const res = await api("DELETE", "/api/runs");
     $("#runs-tbody").innerHTML = `<tr><td colspan="6" class="py-4 text-gray-400">No saved runs yet. (${res.count} deleted)</td></tr>`;
@@ -317,16 +571,17 @@ async function clearAllRuns() {
 }
 
 async function resetAllData() {
-  if (!confirm("Are you sure you want to clear all processed datasets, models, logs, and metric cards?")) return;
+  if (!confirm("Clear all processed datasets, models, logs, and metric cards?")) return;
   try {
     await api("POST", "/api/reset-all");
     const el = terminal();
     if (el) {
-      el.innerHTML = '<div class="text-gray-500">[SYSTEM] All cached data cleared. Ready for fresh run.</div>';
+      el.innerHTML = '<div class="text-gray-500">[SYSTEM] Cached data cleared — ready for a fresh SSA pipeline run.</div>';
     }
     const status = await api("GET", "/api/status");
     updateStatusUI(status);
     await loadMetrics();
+    await loadPhase3Metrics();
   } catch (e) {
     alert(e.message);
   }
@@ -372,8 +627,14 @@ function connectWebSocket() {
       return;
     }
     if (msg.type === "log" && msg.line) appendLog(msg.line);
-    if (msg.type === "status" && msg.data) updateStatusUI(msg.data);
-    if (msg.type === "metrics_refresh") loadMetrics();
+    if (msg.type === "status" && msg.data) {
+      updateStatusUI(msg.data);
+      const ps = msg.data.pipeline_status;
+      if (ps === "COMPLETED" || ps === "FAILED" || ps === "STOPPED") {
+        scheduleMetricsRefresh();
+      }
+    }
+    if (msg.type === "metrics_refresh") scheduleMetricsRefresh();
   };
 
   ws.onclose = () => {
@@ -396,6 +657,8 @@ async function init() {
   updateStatusUI(status);
 
   $("#btn-run-full").addEventListener("click", runPipeline);
+  const p3Btn = $("#btn-run-phase3");
+  if (p3Btn) p3Btn.addEventListener("click", runPhase3);
   $("#btn-stop").addEventListener("click", stopPipeline);
   $("#btn-reset-all").addEventListener("click", resetAllData);
   $("#btn-clear-log").addEventListener("click", clearTerminalView);
@@ -416,6 +679,7 @@ async function init() {
 
   await loadCurrentMode();
   await loadMetrics();
+  await loadPhase3Metrics();
   await loadPreviousRuns();
   connectWebSocket();
 }
